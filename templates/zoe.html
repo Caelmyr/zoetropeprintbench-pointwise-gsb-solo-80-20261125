@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zoetrope Print Bench</title>
+  <link rel="stylesheet" href="/static/zoe.css">
+  <script src="/static/zoe.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="wordmark" href="/">
+      <span class="drum-icon" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      Zoetrope Print Bench
+    </a>
+    <a class="prep-link" href="/prepare" id="prepLink">Photo preparation <span aria-hidden="true">↗</span></a>
+  </header>
+  <main class="shell">
+    <aside class="sidebar">
+      <div class="library">
+        <h2>Drum library</h2>
+        <label class="reader" for="library">Open a drum</label>
+        <select id="library"><option value="">Open a drum</option></select>
+        <button id="demo" type="button" class="accent">Open sample drum</button>
+        <details id="newPanel">
+          <summary>New drum</summary>
+          <form id="newDraft" class="stack">
+            <label>Drum name <input name="title" required maxlength="100" placeholder="e.g. Sparrow loop"></label>
+            <button class="paper-button">Create drum</button>
+          </form>
+        </details>
+      </div>
+      <section id="drumControls" hidden>
+        <details open>
+          <summary>Drum and paper</summary>
+          <form id="settings">
+            <div class="fields">
+              <label>Circumference (mm) <input type="number" step=".1" name="circumference"></label>
+              <label>Art height (mm) <input type="number" step=".1" name="height_mm"></label>
+              <label>Printer DPI <input type="number" name="dpi"></label>
+              <label>Join tab (mm) <input type="number" step=".1" name="join_mm"></label>
+              <label>Quiet margin (mm) <input type="number" step=".1" name="action_margin"></label>
+              <label>Paper <select name="stock"><option value="ivory">Ivory</option><option value="white">White</option><option value="black">Black</option></select></label>
+            </div>
+            <details class="subdetails">
+              <summary>Slit and shutter</summary>
+              <div class="fields">
+                <label>Slit width (mm) <input type="number" step=".1" name="slot_width"></label>
+                <label>Slit phase (mm) <input type="number" step=".1" name="slot_phase"></label>
+                <label>Rotation (RPM) <input type="number" step=".1" name="rpm"></label>
+                <label>Shutter (ms) <input type="number" step=".1" name="exposure_ms"></label>
+                <label>Direction <select name="direction"><option value="clockwise">Clockwise</option><option value="counterclockwise">Counterclockwise</option></select></label>
+                <label>Scan brightness <input type="number" step=".01" name="threshold"></label>
+              </div>
+            </details>
+            <button class="paper-button">Save drum setup</button>
+          </form>
+        </details>
+        <details>
+          <summary>Import artwork</summary>
+          <form id="importFrame" class="stack">
+            <label>Image file <input type="file" name="file" accept="image/png,image/jpeg,image/tiff,image/webp" required></label>
+            <button class="paper-button">Add frame</button>
+          </form>
+          <form id="contact" class="stack secondary-form">
+            <label>Contact sheet <input type="file" name="file" accept="image/png,image/jpeg,image/tiff,image/webp" required></label>
+            <div class="fields">
+              <label>Rows <input type="number" name="rows" value="2" min="1" required></label>
+              <label>Columns <input type="number" name="columns" value="4" min="1" required></label>
+              <label>Frames <input type="number" name="count" value="8" min="1" required></label>
+              <label>Cell trim (px) <input type="number" name="gutter" value="0" min="0" required></label>
+            </div>
+            <button class="paper-button">Extract frames</button>
+          </form>
+        </details>
+        <details id="scanControls">
+          <summary>Slit photograph</summary>
+          <form id="importScan" class="stack">
+            <label>Flat backlit scan <input type="file" name="file" accept="image/png,image/jpeg,image/tiff,image/webp" required></label>
+            <button class="paper-button">Import scan</button>
+          </form>
+          <form id="register" class="secondary-form" hidden>
+            <button id="showScan" type="button" class="paper-button">Mark image rectangle</button>
+            <div class="fields">
+              <label>Width (mm) <input name="scan_span_mm" type="number" step=".01" required></label>
+              <label>Start at (mm) <input name="origin_mm" type="number" step=".01" required></label>
+            </div>
+            <button class="paper-button">Save scan setup</button>
+          </form>
+        </details>
+      </section>
+    </aside>
+
+    <section class="workbench">
+      <section id="welcome" class="welcome">
+        <div>
+          <h1>From frames to a spinning drum</h1>
+          <p>Lay out a picture ribbon, check what the viewing slits will show, and print the band at actual size.</p>
+          <button id="welcomeDemo" class="accent">Try the reed bird sample</button>
+        </div>
+        <img src="/static/reed-bird.png" alt="A paper-cut green bird and a golden sun from the synthetic example">
+      </section>
+
+      <div id="work" hidden>
+        <div class="workspace-title">
+          <div>
+            <h1 id="draftTitle"></h1>
+            <p id="draftSub"></p>
+          </div>
+          <button type="button" id="reload" class="quiet">Reload drum</button>
+        </div>
+        <div class="workspace-grid">
+          <div class="primary-work">
+            <section class="stage-panel">
+              <div class="stage-toolbar">
+                <div>
+                  <label class="reader" for="mode">Proof mode</label>
+                  <select id="mode"></select>
+                </div>
+                <button id="runProof" class="accent">Save proof</button>
+              </div>
+              <p id="modeNote" class="mode-note"></p>
+              <div class="stage">
+                <div id="scanStage" hidden>
+                  <img id="markedScan" alt="Slot scan to mark" draggable="false">
+                  <div id="scanBox"></div>
+                </div>
+                <img id="stageImage" alt="Current drum artwork or saved proof" hidden>
+                <p id="stageEmpty">Import an image or open a sample to see the artwork.</p>
+              </div>
+              <div class="stage-caption">
+                <span id="stageName"></span>
+                <button id="play" type="button" class="quiet">Play direct loop</button>
+              </div>
+            </section>
+
+            <section class="frame-panel" aria-labelledby="framesTitle">
+              <div class="panel-title"><h2 id="framesTitle">Picture frames</h2><span id="frameCount"></span></div>
+              <div id="frames" class="frames"></div>
+              <form id="frameAdjust" hidden>
+                <div class="frame-selection">
+                  <h3 id="frameTitle"></h3>
+                  <a id="downloadFrame" class="text-link">Original ↗</a>
+                </div>
+                <div class="fields frame-fields">
+                  <label>X offset (mm) <input type="number" name="shift_x" step=".01"></label>
+                  <label>Y offset (mm) <input type="number" name="shift_y" step=".01"></label>
+                  <label>Scale <input type="number" name="scale" step=".01"></label>
+                  <label>Matte <select name="matte"><option value="original">Original</option><option value="white">Remove white</option><option value="black">Remove black</option></select></label>
+                  <label class="check"><input name="flip" type="checkbox"> Mirror frame</label>
+                </div>
+                <div class="frame-actions">
+                  <button class="paper-button">Save frame</button>
+                  <button type="button" id="earlier" class="quiet">Move earlier</button>
+                  <button type="button" id="later" class="quiet">Move later</button>
+                  <button type="button" id="remove" class="quiet danger">Remove frame</button>
+                </div>
+              </form>
+            </section>
+          </div>
+          <aside class="side-work">
+            <section class="results" aria-labelledby="resultsTitle">
+              <h2 id="resultsTitle">Saved proofs</h2>
+              <label class="reader" for="proofHistory">Open proof</label>
+              <select id="proofHistory"><option value="">Open proof</option></select>
+              <div id="resultDetail" hidden>
+                <h3 id="proofTitle"></h3>
+                <dl id="summary"></dl>
+                <div class="downloads">
+                  <a id="pngLink" class="paper-button">PNG</a>
+                  <a id="csvLink" class="paper-button">CSV</a>
+                  <a id="zipLink" class="paper-button">Proof ZIP</a>
+                </div>
+                <div id="rowBlock" class="row-block" hidden>
+                  <table>
+                    <thead id="resultColumns"></thead>
+                    <tbody id="resultRows"></tbody>
+                  </table>
+                </div>
+              </div>
+            </section>
+          </aside>
+        </div>
+      </div>
+      <p class="status" id="status" role="status"></p>
+    </section>
+  </main>
+</body>
+</html>

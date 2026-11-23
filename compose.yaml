@@ -1,0 +1,23 @@
+name: solo83-zoebench
+services:
+  desk:
+    build:
+      context: .
+      args:
+        ZOEBENCH_RUNTIME_IMAGE: ${ZOEBENCH_RUNTIME_IMAGE:-python:3.12-slim}
+    image: ${ZOEBENCH_IMAGE:-solo83-zoebench:1.0}
+    network_mode: bridge
+    environment:
+      OPENBLAS_NUM_THREADS: 1
+      OMP_NUM_THREADS: 1
+    ports:
+      - "127.0.0.1:${ZOEBENCH_PORT:-19883}:8000"
+    volumes:
+      - drum-library:/var/lib/zoebench
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8000/zoe/health', timeout=3).status == 200"]
+      interval: 3s
+      timeout: 4s
+      retries: 12
+volumes:
+  drum-library:
