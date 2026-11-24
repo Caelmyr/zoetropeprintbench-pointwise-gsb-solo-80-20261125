@@ -135,7 +135,12 @@ function renderFrames() {
       desk.active = item.id;
       for (const other of ui('frames').children) other.setAttribute('aria-pressed', String(other === button));
       renderAdjustment(item);
-      frameStage();
+      const overlay = lineageOverlayUrl(index + 1);
+      if (overlay) {
+        showImage(overlay, 'Cross-revision overlay', 'Cross-revision overlay · frame ' + (index + 1));
+      } else {
+        frameStage();
+      }
     });
     return button;
   }));
@@ -176,6 +181,7 @@ function renderDraft(draft, preserveFrame = true) {
   if (draft.scan) fields(ui('register'), draft.scan.registration);
   renderFrames();
   renderArchive();
+  renderLineagePanel();
   frameStage();
   history.replaceState({}, '', '/?drum=' + draft.id);
 }
@@ -245,8 +251,63 @@ function setProof(detail) {
   desk.record = detail;
   renderArchive();
   renderSummary(detail);
+  if (detail.mode === 'lineage') {
+    renderRetainedLineage(detail);
+    return;
+  }
+  ui('lineageQuestions').replaceChildren();
   const url = '/zoe' + draftPath() + '/proofs/' + detail.id + '/image';
   showImage(url, detail.title, detail.title + ' · ' + detail.size.join(' × ') + ' px' + (detail.dpi ? ' · ' + detail.dpi + ' DPI' : ''));
+}
+
+function renderRetainedLineage(detail) {
+  const body = ui('lineageRows');
+  const questionBlock = ui('lineageQuestions');
+  questionBlock.replaceChildren();
+  const questions = detail.lineage.questions || [];
+  if (questions.length) {
+    const heading = document.createElement('h3');
+    heading.textContent = 'Pause-area judgements retained with this proof';
+    questionBlock.append(heading);
+    for (const question of questions) {
+      const card = document.createElement('div');
+      card.className = 'lineage-question';
+      const lead = document.createElement('p');
+      lead.textContent = 'New frame ' + question.new_frame + ' was reviewed.';
+      const advice = document.createElement('p');
+      advice.className = 'lineage-advice';
+      advice.textContent = 'Suggested old ' + question.suggested_old_frame + '. ' + question.reason;
+      card.append(lead, advice);
+      questionBlock.append(card);
+    }
+  }
+  body.replaceChildren(...detail.lineage.pairs.map(row => {
+    const tr = document.createElement('tr');
+    tr.className = 'lineage-row-' + row.status;
+    const cells = [
+      row.new_frame,
+      row.old_frame ? String(row.old_frame) : '—',
+      row.pose_score === null || row.pose_score === '' ? '—' : Number(row.pose_score).toFixed(2),
+      row.continuity_score === null || row.continuity_score === '' ? '—' : Number(row.continuity_score).toFixed(2),
+      statusText(row.status),
+    ];
+    for (const value of cells) {
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.append(td);
+    }
+    return tr;
+  }));
+  const dropped = ui('lineageDropped');
+  const droppedRows = (detail.rows || []).filter(row => row.status === 'old_frame_without_new_partner');
+  dropped.hidden = !droppedRows.length;
+  dropped.textContent = droppedRows.length
+    ? 'Old frames without a new counterpart: ' + droppedRows.map(row => 'old ' + row.old_frame).join(', ')
+    : '';
+  ui('lineageResult').hidden = false;
+  ui('lineagePanel').hidden = false;
+  const url = lineageOverlayUrl(1) || ('/zoe' + draftPath() + '/proofs/' + detail.id + '/image');
+  showImage(url, detail.title, detail.title + ' · click any current frame for its paired old frame');
 }
 
 function setCrop(crop) {
@@ -410,6 +471,178 @@ on('proofHistory', 'change', async () => {
     frameStage();
   }
 });
+
+const lineage = { analysis: null, savedId: null };
+
+function lineageProofChoices() {
+  const usable = desk.draft.proofs.filter(item => item.mode !== 'lineage');
+  options(ui('lineageProof'), [['', 'Select retained proof'], ...usable.map(item => [item.id, item.title])]);
+}
+
+function fillAnchor(select, count, prefix) {
+  select.replaceChildren(...Array.from({ length: count }, (_, index) =>
+    new Option(prefix + ' ' + (index + 1), String(index))));
+}
+
+function renderLineagePanel() {
+  lineage.analysis = null;
+  lineage.savedId = null;
+  ui('lineageResult').hidden = true;
+  const hasOldProof = desk.draft.proofs.some(item => item.mode !== 'lineage');
+  ui('lineagePanel').hidden = !hasOldProof || desk.draft.frames.length < 2;
+  if (!hasOldProof) return;
+  lineageProofChoices();
+  fillAnchor(ui('lineageNewAnchor'), desk.draft.frames.length, 'New');
+  ui('lineageOldAnchor').replaceChildren();
+}
+
+on('lineageProof', 'change', async () => {
+  ui('lineageResult').hidden = true;
+  const id = ui('lineageProof').value;
+  ui('lineageOldAnchor').replaceChildren();
+  if (!id) return;
+  const detail = await ask(draftPath() + '/proofs/' + id);
+  if (!detail.frames || !detail.frames.length) {
+    notice('That retained proof does not carry a complete frame loop.', true);
+    ui('lineageProof').value = '';
+    return;
+  }
+  fillAnchor(ui('lineageOldAnchor'), detail.frames.length, 'Old');
+});
+
+function statusText(status) {
+  return {
+    anchor: 'anchor', matched: 'matched', uncertain: 'uncertain',
+    unmatched: 'no reliable match', old_frame_without_new_partner: 'old frame, no new partner',
+  }[status] || status;
+}
+
+function renderLineageAnalysis(analysis) {
+  lineage.analysis = analysis;
+  ui('lineageResult').hidden = false;
+  const questionBlock = ui('lineageQuestions');
+  questionBlock.replaceChildren();
+  if (analysis.questions.length) {
+    const heading = document.createElement('h3');
+    heading.textContent = 'Frames near the held pause need a judgement';
+    questionBlock.append(heading);
+    for (const question of analysis.questions) {
+      const card = document.createElement('div');
+      card.className = 'lineage-question';
+      const lead = document.createElement('p');
+      lead.textContent = 'New frame ' + question.new_frame
+        + (question.current_old_frame ? ' currently pairs with old ' + question.current_old_frame
+          : ' currently has no old partner') + '.';
+      const advice = document.createElement('p');
+      advice.className = 'lineage-advice';
+      advice.textContent = 'Suggested: old ' + question.suggested_old_frame + '. ' + question.reason;
+      const choices = document.createElement('div');
+      choices.className = 'lineage-choice-row';
+      for (const alternative of question.alternatives) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'paper-button' + (alternative.old_frame === question.suggested_old_frame ? ' suggested' : '');
+        button.disabled = alternative.in_use_elsewhere;
+        button.textContent = 'Old ' + alternative.old_frame
+          + ' · pose ' + alternative.pose_score.toFixed(2)
+          + ' · flow ' + alternative.continuity_score.toFixed(2)
+          + (alternative.in_use_elsewhere ? ' (used)' : '');
+        button.addEventListener('click', () => {
+          const row = analysis.pairs.find(item => item.new_frame === question.new_frame);
+          for (const other of analysis.pairs) {
+            if (other.old_frame === alternative.old_frame && other.new_frame !== question.new_frame) {
+              other.old_frame = null;
+              other.old_title = null;
+              other.status = 'unmatched';
+              other.reliable = false;
+              other.pose_score = null;
+              other.continuity_score = null;
+            }
+          }
+          row.old_frame = alternative.old_frame;
+          row.old_title = 'Old frame ' + alternative.old_frame;
+          row.pose_score = alternative.pose_score;
+          row.continuity_score = alternative.continuity_score;
+          row.status = row.anchor ? 'anchor' : alternative.pose_score >= 0.58 ? 'matched' : 'uncertain';
+          row.reliable = alternative.pose_score >= 0.58;
+          renderLineageAnalysis(analysis);
+        });
+        choices.append(button);
+      }
+      card.append(lead, advice, choices);
+      questionBlock.append(card);
+    }
+  }
+  const body = ui('lineageRows');
+  body.replaceChildren(...analysis.pairs.map(row => {
+    const tr = document.createElement('tr');
+    tr.className = 'lineage-row-' + row.status;
+    const cells = [
+      row.new_frame,
+      row.old_frame ? String(row.old_frame) : '—',
+      row.pose_score === null ? '—' : Number(row.pose_score).toFixed(2),
+      row.continuity_score === null ? '—' : Number(row.continuity_score).toFixed(2),
+      statusText(row.status),
+    ];
+    for (const value of cells) {
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.append(td);
+    }
+    return tr;
+  }));
+  const dropped = ui('lineageDropped');
+  dropped.hidden = !analysis.dropped.length;
+  dropped.textContent = analysis.dropped.length
+    ? 'Old frames without a new counterpart: ' + analysis.dropped.map(item => 'old ' + item.old_frame).join(', ')
+    : '';
+}
+
+on('lineageAnalyze', 'click', async () => {
+  const proofId = ui('lineageProof').value;
+  if (!proofId) {
+    notice('Choose the retained proof of the earlier loop first.', true);
+    return;
+  }
+  const analysis = await ask(draftPath() + '/lineage/analyze', 'POST', {
+    lineage_proof: proofId,
+    anchor_old: Number(ui('lineageOldAnchor').value),
+    anchor_new: Number(ui('lineageNewAnchor').value),
+  });
+  renderLineageAnalysis(analysis);
+  notice('Correspondence built along the loop order. Review uncertain frames before adopting it.');
+});
+
+on('lineageAdopt', 'click', async () => {
+  if (!lineage.analysis) return;
+  const saved = await ask(draftPath() + '/proofs', 'POST', {
+    mode: 'lineage',
+    revision: desk.draft.revision,
+    lineage_proof: ui('lineageProof').value,
+    anchor_old: Number(ui('lineageOldAnchor').value),
+    anchor_new: Number(ui('lineageNewAnchor').value),
+    mapping: {
+      pairs: lineage.analysis.pairs,
+      dropped: lineage.analysis.dropped,
+      questions: lineage.analysis.questions,
+    },
+  });
+  desk.draft = saved.draft;
+  lineage.savedId = saved.proof.id;
+  renderArchive();
+  lineageProofChoices();
+  fillAnchor(ui('lineageNewAnchor'), desk.draft.frames.length, 'New');
+  ui('lineagePanel').hidden = false;
+  ui('proofHistory').value = saved.proof.id;
+  setProof(saved.proof);
+  notice('Retained the cross-revision lineage. Click any current frame to see its paired old frame.');
+});
+
+function lineageOverlayUrl(frameNumber) {
+  const record = desk.record;
+  if (!record || record.mode !== 'lineage' || !record.lineage) return null;
+  return '/zoe' + draftPath() + '/lineage/' + record.id + '/overlay/' + frameNumber;
+}
 
 (async () => {
   try {

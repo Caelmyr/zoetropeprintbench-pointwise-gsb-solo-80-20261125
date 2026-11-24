@@ -7,7 +7,7 @@ from flask import Blueprint, Response, jsonify, render_template, request, send_f
 
 from image_lab.validation import Conflict, Invalid
 
-from . import demo, layout, model, proof, raster
+from . import demo, layout, lineage, model, proof, raster
 from .store import Library
 
 MAX_DRUM_FRAME_BYTES = 100 * 1024 * 1024
@@ -18,6 +18,7 @@ MODE_NOTES = {
     "direct-loop": "Step through the source artwork at its print framing.",
     "optical-loop": "Approximate one slit exposure at the current rotation and exposure time.",
     "neighbors": "Red shows the previous silhouette and teal shows the next silhouette.",
+    "lineage": "Align the current loop against a retained proof: each old frame is used once and unreliable frames are flagged.",
     "coverage": "Compare visible ink, clipped ink and ink inside the quiet margin.",
     "motion": "Trace the center of visible ink across the full loop.",
     "contrast": "Blue marks very dark values and ochre marks very light values on the selected paper.",
@@ -46,6 +47,29 @@ def form_revision():
 def check_revision(draft, revision):
     if type(revision) is not int or revision != draft["revision"]:
         raise Conflict("This drum changed. Reload it before saving.")
+
+
+def retained_lineage_proof(library, draft, proof_key):
+    record = library.proof(draft, proof_key)
+    if not record.get("frames"):
+        raise Invalid("The retained proof does not carry a complete frame loop and cannot anchor a lineage.")
+    return record
+
+
+def lineage_paintings(library, record, draft):
+    old_frames, old_settings = record["frames"], record["source_settings"]
+    old_track = layout.uniform_track(len(old_frames), old_settings)
+    old_painted = []
+    for index, frame in enumerate(old_frames):
+        cell = old_track.cells[index]
+        source = raster.decode(library.blob(frame["blob"]).read_bytes())
+        width, height = proof.screen_size(old_track, cell)
+        old_painted.append(lineage.frame_image(source, frame, old_track, cell, width, height))
+    new_track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+    new_painted = [proof.screen_frame(
+        lambda frame: raster.decode(library.blob(frame["blob"]).read_bytes()), draft, new_track, index,
+    ) for index in range(len(draft["frames"]))]
+    return old_frames, old_painted, new_painted
 
 
 def append_frames(draft, items, library):
@@ -236,6 +260,43 @@ def install(app, root):
         image.thumbnail((1600, 500))
         return Response(raster.png(image), mimetype="image/png")
 
+    def _validated_mapping(payload, record, draft):
+        if not isinstance(payload, dict) or not isinstance(payload.get("pairs"), list):
+            raise Invalid("The adopted lineage mapping is malformed.")
+        used_old, seen_new = set(), set()
+        pairs = []
+        for item in payload["pairs"]:
+            new_index = model.integer(item.get("new_frame"), "a current frame", 1, len(draft["frames"])) - 1
+            if new_index in seen_new:
+                raise Invalid("Each current frame can appear only once in the lineage.")
+            seen_new.add(new_index)
+            old_value = item.get("old_frame")
+            entry = {
+                "new_frame": new_index + 1, "new_title": draft["frames"][new_index]["title"],
+                "old_frame": None, "old_title": None, "pose_score": item.get("pose_score"),
+                "continuity_score": item.get("continuity_score"),
+                "reliable": bool(item.get("reliable")), "anchor": bool(item.get("anchor")),
+                "status": model.option(item.get("status", "unmatched"),
+                                       ("matched", "anchor", "uncertain", "unmatched"), "lineage status"),
+            }
+            if old_value not in (None, ""):
+                old_index = model.integer(old_value, "an old frame", 1, len(record["frames"])) - 1
+                if old_index in used_old:
+                    raise Invalid("Each retained frame can be paired with only one current frame.")
+                used_old.add(old_index)
+                entry["old_frame"] = old_index + 1
+                entry["old_title"] = record["frames"][old_index]["title"]
+            pairs.append(entry)
+        if len(seen_new) != len(draft["frames"]):
+            raise Invalid("The lineage must cover every current frame.")
+        dropped = []
+        for item in payload.get("dropped", []):
+            old_index = model.integer(item.get("old_frame"), "an old frame", 1, len(record["frames"])) - 1
+            dropped.append({"old_frame": old_index + 1,
+                            "old_title": record["frames"][old_index]["title"]})
+        questions = payload.get("questions") if isinstance(payload.get("questions"), list) else []
+        return {"pairs": pairs, "dropped": dropped}, questions
+
     @api.post("/drafts/<key>/proofs")
     def retain_proof(key):
         data = payload()
@@ -245,14 +306,103 @@ def install(app, root):
         mode = model.option(data.get("mode"), model.PROOF_MODES, "proof mode")
         if mode == "scan" and draft["scan"] is None:
             raise Invalid("Import a slit photograph before measuring openings.")
-        if "frame" in data:
-            active = model.integer(data["frame"], "proof frame", 0, model.MAX_IMAGES - 1)
-            draft["settings"]["proof_frame"] = active
-        image, summary, rows, dpi = proof.render(mode, draft, library)
-        result = proof.header(mode, draft, summary, rows, image.size, dpi)
+        extra = None
+        if mode == "lineage":
+            record = retained_lineage_proof(library, draft, model.identifier(data.get("lineage_proof")))
+            anchor_old = model.integer(data.get("anchor_old"), "the old anchor frame", 0, model.MAX_IMAGES - 1)
+            anchor_new = model.integer(data.get("anchor_new"), "the current anchor frame", 0, model.MAX_IMAGES - 1)
+            if anchor_old >= len(record["frames"]) or anchor_new >= len(draft["frames"]):
+                raise Invalid("The anchor frame must exist in both loops.")
+            fixed_mapping, questions = (None, None)
+            if data.get("mapping"):
+                fixed_mapping, questions = _validated_mapping(data["mapping"], record, draft)
+            image, summary, rows, dpi, extra = proof.render(
+                "lineage", draft, library,
+                {"saved_proof": record, "anchor_old": anchor_old, "anchor_new": anchor_new,
+                 "fixed_mapping": fixed_mapping, "questions": questions},
+            )
+        else:
+            if "frame" in data:
+                active = model.integer(data["frame"], "proof frame", 0, model.MAX_IMAGES - 1)
+                draft["settings"]["proof_frame"] = active
+            image, summary, rows, dpi = proof.render(mode, draft, library)
+        result = proof.header(mode, draft, summary, rows, image.size, dpi, extra)
+        if mode == "lineage":
+            result["lineage_old_frames"] = record["frames"]
         result["image"] = library.keep(raster.png(image, dpi))
         updated, saved = library.retain(key, revision, result)
         return jsonify(draft=updated, proof=saved), 201
+
+    @api.post("/drafts/<key>/lineage/analyze")
+    def lineage_analyze(key):
+        data = payload()
+        draft = library.draft(key)
+        record = retained_lineage_proof(library, draft, model.identifier(data.get("lineage_proof")))
+        anchor_old = model.integer(data.get("anchor_old"), "the old anchor frame", 0, model.MAX_IMAGES - 1)
+        anchor_new = model.integer(data.get("anchor_new"), "the current anchor frame", 0, model.MAX_IMAGES - 1)
+        if anchor_old >= len(record["frames"]) or anchor_new >= len(draft["frames"]):
+            raise Invalid("The anchor frame must exist in both loops.")
+        old_frames, old_painted, new_painted = lineage_paintings(library, record, draft)
+        alignment, questions = lineage.build_analysis(old_painted, new_painted, anchor_old, anchor_new)
+        mapping, dropped = lineage.correspondence(alignment, old_frames, draft["frames"])
+        score_rows = [
+            {"old_frame": old + 1, "new_frame": new + 1, "pose_score": round(float(value), 4)}
+            for old, row in enumerate(alignment.score_table) for new, value in enumerate(row)
+        ]
+        return jsonify(
+            anchor_old_frame=anchor_old + 1, anchor_new_frame=anchor_new + 1,
+            pairs=mapping, dropped=dropped, questions=questions, score_table=score_rows,
+            old_frames=[{"frame": index + 1, "title": frame["title"]}
+                        for index, frame in enumerate(old_frames)],
+        )
+
+    @api.get("/drafts/<key>/lineage/<proof_key>/old-frame/<int:frame_number>")
+    def lineage_old_frame(key, proof_key, frame_number):
+        draft = library.draft(key)
+        record = retained_lineage_proof(library, draft, proof_key)
+        if not 1 <= frame_number <= len(record["frames"]):
+            raise Invalid("That old frame is outside the retained loop.")
+        frame = record["frames"][frame_number - 1]
+        track = layout.uniform_track(len(record["frames"]), record["source_settings"])
+        cell = track.cells[frame_number - 1]
+        source = raster.decode(library.blob(frame["blob"]).read_bytes())
+        image = lineage.frame_image(source, frame, track, cell, *proof.screen_size(track, cell))
+        return Response(raster.png(image), mimetype="image/png")
+
+    @api.get("/drafts/<key>/lineage/<proof_key>/overlay/<int:frame_number>")
+    def lineage_overlay(key, proof_key, frame_number):
+        draft = library.draft(key)
+        record = library.proof(draft, proof_key)
+        if record.get("mode") != "lineage" or not record.get("lineage"):
+            raise Invalid("Open a retained cross-revision lineage proof to view its overlays.")
+        if not 1 <= frame_number <= len(draft["frames"]):
+            raise Invalid("That current frame is outside this drum.")
+        new_index = frame_number - 1
+        new_track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+        new_image = proof.screen_frame(
+            lambda frame: raster.decode(library.blob(frame["blob"]).read_bytes()),
+            draft, new_track, new_index,
+        )
+        pair = next(item for item in record["lineage"]["pairs"] if item["new_frame"] == frame_number)
+        if pair["old_frame"] is None:
+            image = lineage.unmatched_canvas(
+                new_image, draft["settings"]["stock"],
+                f"new {frame_number} · no reliable old counterpart",
+            )
+        else:
+            old_index = pair["old_frame"] - 1
+            old_frame = record["lineage_old_frames"][old_index]
+            old_track = layout.uniform_track(len(record["lineage_old_frames"]), record["source_settings"])
+            old_cell = old_track.cells[old_index]
+            old_source = raster.decode(library.blob(old_frame["blob"]).read_bytes())
+            old_image = lineage.frame_image(old_source, old_frame, old_track, old_cell,
+                                            *proof.screen_size(old_track, old_cell))
+            image = lineage.overlay_pair(
+                new_image, old_image, draft["settings"]["stock"],
+                f"new {frame_number} / old {pair['old_frame']}"
+                + ("  (uncertain)" if pair["status"] == "uncertain" else ""),
+            )
+        return Response(raster.png(image), mimetype="image/png")
 
     @api.get("/drafts/<key>/proofs/<proof_key>")
     def proof_detail(key, proof_key):

@@ -18,6 +18,7 @@ The `drum-library` Docker volume keeps drafts and retained proofs. `./start.sh -
 | Direct frame loop | The selected print-framed artwork. The Play direct loop button advances the sequence at the selected RPM. |
 | Slit-view proof | Predicted blur and edge contamination from a finite slit and one shutter interval. |
 | Previous and next frame | An overlay of neighbouring silhouettes, including the wraparound pair. |
+| Cross-revision lineage | A frame-by-frame correspondence between the current loop and a retained proof of an earlier shoot, anchored on one recognized frame. Each old frame is used at most once, unmatched frames are flagged, and pause-area look-alikes get pose-and-flow advice. |
 | Print clipping map | Ink cut by the cell and ink close to its quiet margin after each placement. |
 | Loop motion trace | The visible ink centers and their path through the full sequence. |
 | Proof tone inspection | Dark and light regions and the linear luminance distribution on the selected stock. |

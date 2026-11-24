@@ -119,6 +119,23 @@ td, th { padding: .43rem .53rem; border-bottom: 1px solid var(--line); }
 td { white-space: nowrap; }
 .status { white-space: normal; color: var(--teal); margin-top: .8rem; font-size: .85rem; }
 .status.error { color: var(--danger); }
+
+.lineage-panel { margin-top: 1rem; }
+.lineage-intro { font-size: .74rem; color: var(--muted); margin: .55rem 0 .7rem; line-height: 1.5; }
+.lineage-panel .stack { gap: .6rem; }
+.lineage-questions h3 { font-size: .8rem; margin: .35rem 0 .45rem; }
+.lineage-question { border: 1px solid var(--line); border-radius: 8px; background: #f1f0e1; padding: .55rem; margin-bottom: .55rem; }
+.lineage-question p { font-size: .72rem; margin-bottom: .35rem; }
+.lineage-advice { color: var(--teal); font-weight: 650; line-height: 1.45; }
+.lineage-choice-row { display: flex; flex-wrap: wrap; gap: .3rem; }
+.lineage-choice-row button { padding: .35rem .45rem; font-size: .68rem; white-space: normal; }
+.lineage-choice-row .suggested { border-color: var(--teal); background: #deeee3; }
+.lineage-table { max-height: 260px; margin: .6rem 0; }
+.lineage-row-uncertain { color: var(--danger); font-weight: 700; }
+.lineage-row-unmatched { color: var(--muted); }
+.lineage-row-anchor { font-weight: 700; }
+.lineage-dropped { font-size: .7rem; color: var(--muted); margin: .45rem 0; }
+#lineageAdopt { width: 100%; margin-top: .35rem; }
 @media(max-width: 1050px) {
   .workspace-grid { grid-template-columns: minmax(0, 1fr); }
   .results dl { grid-template-columns: minmax(0, 1fr) auto; }

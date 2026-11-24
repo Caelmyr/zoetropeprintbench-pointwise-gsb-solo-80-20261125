@@ -7,7 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import numpy as np
 from PIL import Image, ImageDraw
 
-from . import layout, optics, raster, scan
+from . import layout, lineage, optics, raster, scan
 from .model import PROOF_MODES
 from .store import json_bytes
 
@@ -165,6 +165,70 @@ def assembly(draft, track, source):
     return layout.join_preview(image, track), summary, [], None
 
 
+def _revision_painted(frames, settings, library, max_edge=420):
+    """Render every frame of one revision using that revision's own print placement."""
+    track = layout.uniform_track(len(frames), settings)
+    painted = []
+    for index, frame in enumerate(frames):
+        cell = track.cells[index]
+        source = raster.decode(library.blob(frame["blob"]).read_bytes())
+        width, height = screen_size(track, cell, max_edge)
+        painted.append(lineage.frame_image(source, frame, track, cell, width, height))
+    return painted, track
+
+
+def render_lineage(library, draft, saved, anchor_old, anchor_new, fixed_mapping=None, questions=None):
+    old_frames = saved["frames"]
+    old_settings = saved["source_settings"]
+    old_painted, _old_track = _revision_painted(old_frames, old_settings, library)
+    new_track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+
+    def source(frame):
+        return raster.decode(library.blob(frame["blob"]).read_bytes())
+
+    new_painted = [screen_frame(source, draft, new_track, index)
+                   for index in range(len(draft["frames"]))]
+    if fixed_mapping is None:
+        alignment, found_questions = lineage.build_analysis(old_painted, new_painted, anchor_old, anchor_new)
+        mapping, dropped = lineage.correspondence(alignment, old_frames, draft["frames"])
+        questions = found_questions
+    else:
+        mapping = fixed_mapping["pairs"]
+        dropped = fixed_mapping["dropped"]
+        alignment = None
+        questions = questions or []
+    sheet = lineage.lineage_sheet(alignment, old_painted, new_painted, mapping, dropped,
+                                  draft["settings"]["stock"])
+    summary = {
+        "anchor_old_frame": anchor_old + 1, "anchor_new_frame": anchor_new + 1,
+        "old_loop_frames": len(old_frames), "current_loop_frames": len(draft["frames"]),
+        "matched_frames": sum(item["status"] in {"matched", "anchor"} for item in mapping),
+        "uncertain_frames": sum(item["status"] == "uncertain" for item in mapping),
+        "unmatched_new_frames": sum(item["status"] == "unmatched" for item in mapping),
+        "old_frames_without_new_partner": len(dropped),
+        "source_proof_title": saved["title"],
+    }
+    rows = [
+        {"new_frame": item["new_frame"], "new_title": item["new_title"],
+         "old_frame": item["old_frame"] or "", "old_title": item["old_title"] or "",
+         "pose_score": item["pose_score"] if item["pose_score"] is not None else "",
+         "continuity_score": item["continuity_score"] if item["continuity_score"] is not None else "",
+         "status": item["status"]}
+        for item in mapping
+    ]
+    rows.extend({"new_frame": "", "new_title": "", "old_frame": item["old_frame"],
+                 "old_title": item["old_title"], "pose_score": "", "continuity_score": "",
+                 "status": "old_frame_without_new_partner"} for item in dropped)
+    detail = {
+        "lineage": {
+            "source_proof_id": saved["id"],
+            "anchor_old_frame": anchor_old, "anchor_new_frame": anchor_new,
+            "pairs": mapping, "dropped": dropped, "questions": questions,
+        },
+    }
+    return sheet, summary, rows, None, detail
+
+
 RENDERERS = {
     "ribbon": ribbon_proof, "cut-guide": cut_guide, "slot-ruler": slot_ruler, "direct-loop": direct_loop,
     "optical-loop": optical_loop, "neighbors": neighbors, "coverage": coverage, "motion": motion,
@@ -172,11 +236,18 @@ RENDERERS = {
 }
 
 
-def render(mode, draft, library):
+def render(mode, draft, library, context=None):
     if mode == "scan":
         sample = draft["scan"]
         picture = raster.decode(library.blob(sample["blob"]).read_bytes())
         return *scan.extract(picture, sample["registration"], draft["settings"]["threshold"]), None
+    if mode == "lineage":
+        context = context or {}
+        return render_lineage(
+            library, draft, context["saved_proof"],
+            context["anchor_old"], context["anchor_new"],
+            context.get("fixed_mapping"), context.get("questions"),
+        )
     track = layout.uniform_track(len(draft["frames"]), draft["settings"])
 
     def source(frame):
@@ -185,12 +256,15 @@ def render(mode, draft, library):
     return RENDERERS[mode](draft, track, source)
 
 
-def header(mode, draft, summary, rows, size, dpi):
-    return {
+def header(mode, draft, summary, rows, size, dpi, extra=None):
+    result = {
         "mode": mode, "title": PROOF_MODES[mode], "summary": summary, "rows": rows,
         "source_settings": draft["settings"], "frames": draft["frames"], "scan": draft["scan"] if mode == "scan" else None,
         "size": list(size), "dpi": dpi, "project_title": draft["title"], "synthetic": draft["synthetic"],
     }
+    if extra:
+        result.update(extra)
+    return result
 
 
 def rows_csv(rows):
@@ -218,4 +292,8 @@ def packet(library, detail):
                               for frame in detail["frames"] if "contact" in frame}
             for index, (digest, filename) in enumerate(contact_sheets.items(), 1):
                 zipfile.writestr(f"contacts/{index:02}-{filename}", library.blob(digest).read_bytes())
+        if detail.get("lineage"):
+            for index, frame in enumerate(detail["lineage_old_frames"], 1):
+                zipfile.writestr(f"lineage-old-frames/{index:02}-{frame['filename']}",
+                                 library.blob(frame["blob"]).read_bytes())
     return buffer.getvalue()

@@ -15,6 +15,7 @@ PROOF_MODES = {
     "direct-loop": "Direct frame loop",
     "optical-loop": "Slit-view proof",
     "neighbors": "Previous and next frame",
+    "lineage": "Cross-revision lineage",
     "coverage": "Print clipping map",
     "motion": "Loop motion trace",
     "contrast": "Proof tone inspection",

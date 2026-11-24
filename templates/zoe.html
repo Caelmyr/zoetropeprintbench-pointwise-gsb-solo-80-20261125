@@ -179,6 +179,38 @@
                 </div>
               </div>
             </section>
+
+            <section class="results lineage-panel" id="lineagePanel" aria-labelledby="lineageTitle" hidden>
+              <h2 id="lineageTitle">Cross-revision lineage</h2>
+              <p class="lineage-intro">Match the current loop against a retained proof from the earlier shoot. Pick the one frame you recognize in both loops as the anchor.</p>
+              <div class="stack">
+                <label>Retained proof (old loop)
+                  <select id="lineageProof"></select>
+                </label>
+                <div class="fields">
+                  <label>Old anchor frame
+                    <select id="lineageOldAnchor"></select>
+                  </label>
+                  <label>Current anchor frame
+                    <select id="lineageNewAnchor"></select>
+                  </label>
+                </div>
+                <button type="button" id="lineageAnalyze" class="paper-button">Build correspondence</button>
+              </div>
+              <div id="lineageResult" hidden>
+                <div id="lineageQuestions" class="lineage-questions"></div>
+                <div class="row-block lineage-table">
+                  <table>
+                    <thead>
+                      <tr><th>New</th><th>Old</th><th>Pose</th><th>Flow</th><th>Status</th></tr>
+                    </thead>
+                    <tbody id="lineageRows"></tbody>
+                  </table>
+                </div>
+                <p id="lineageDropped" class="lineage-dropped"></p>
+                <button type="button" id="lineageAdopt" class="accent">Adopt correspondence as proof</button>
+              </div>
+            </section>
           </aside>
         </div>
       </div>
