@@ -97,7 +97,7 @@ def find(records, key, label):
 
 def settings(data, current=None):
     source = {**DEFAULT_SETTINGS, **(current or {}), **document(data)}
-    return {
+    clean = {
         "circumference": number(source["circumference"], "drum circumference (mm)", 120, 680),
         "height_mm": number(source["height_mm"], "art height (mm)", 20, 100),
         "dpi": integer(source["dpi"], "printer DPI", 120, 360),
@@ -112,6 +112,15 @@ def settings(data, current=None):
         "proof_frame": integer(source["proof_frame"], "proof frame", 0, MAX_IMAGES - 1),
         "threshold": number(source["threshold"], "slot brightness", .1, .95),
     }
+    # Preserve feature-specific keys a client may round-trip (ink levels and
+    # separation options) without the core form knowing their validation.
+    known = set(DEFAULT_SETTINGS)
+    for key, value in source.items():
+        if key in known or not isinstance(key, str) or len(key) > 64:
+            continue
+        if isinstance(value, (str, int, float, bool, list, dict)) or value is None:
+            clean[key] = value
+    return clean
 
 
 def frame_transform(data, current=None):

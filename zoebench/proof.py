@@ -7,7 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import numpy as np
 from PIL import Image, ImageDraw
 
-from . import layout, optics, raster, scan
+from . import layout, optics, raster, scan, separation
 from .model import PROOF_MODES
 from .store import json_bytes
 
@@ -47,6 +47,18 @@ def _ribbon_rows(track, frames):
 
 
 def ribbon_proof(draft, track, source):
+    plan = draft.get("separation") or {}
+    if plan.get("adopted") and plan.get("swatches"):
+        image = separation.separated_ribbon(
+            track, draft["frames"], source, draft["settings"]["stock"],
+            separation.normalize_state(plan, draft),
+        )
+        summary = {
+            **_print_summary(track), "ink_separated": True,
+            "gray_levels": separation.tone_bytes(plan),
+            "primary_colors": len(plan.get("swatches", [])),
+        }
+        return image, summary, _ribbon_rows(track, draft["frames"]), track.dpi
     image = layout.picture_ribbon(track, draft["frames"], source, draft["settings"]["stock"])
     return image, _print_summary(track), _ribbon_rows(track, draft["frames"]), track.dpi
 
@@ -133,6 +145,9 @@ def motion(draft, track, source):
 
 def contrast(draft, track, source):
     index = selected_frame(draft["settings"], track)
+    plan = draft.get("separation") or {}
+    if plan.get("adopted") and plan.get("swatches"):
+        return separated_contrast(draft, track, source, index, plan)
     image = styled_frame(source, draft, track, index)
     exposure = raster.luminance(image)
     quantiles = np.quantile(exposure, [.05, .5, .95])
@@ -147,6 +162,50 @@ def contrast(draft, track, source):
     rows = [{"linear_min": i / 10, "linear_max": (i + 1) / 10, "pixels": int(count)}
             for i, count in enumerate(histogram)]
     return Image.fromarray(canvas), summary, rows, None
+
+
+def separated_contrast(draft, track, source, index, plan):
+    """Tone inspection against the exact adopted device-pixel ribbon."""
+    state = separation.normalize_state(plan, draft)
+    band = separation.separated_ribbon(
+        track, draft["frames"], source, draft["settings"]["stock"], state)
+    checks = separation.check_marks(band, track, draft, state)
+
+    cell = track.cells[index]
+    x0, x1 = track.x(cell.start), track.x(cell.end)
+    device_cell = band.crop((x0, 0, x1, band.height))
+    exposure = raster.luminance(device_cell)
+    quantiles = np.quantile(exposure, [.05, .5, .95])
+    histogram, _ = np.histogram(exposure, bins=10, range=(0, 1))
+    separated_count = sum(1 for check in checks if check["separated"])
+    summary = {
+        "linear_p05": round(float(quantiles[0]), 4), "linear_median": round(float(quantiles[1]), 4),
+        "linear_p95": round(float(quantiles[2]), 4), "linear_range": round(float(quantiles[2] - quantiles[0]), 4),
+        "ink_separated": True, "gray_levels": separation.tone_bytes(state),
+        "marked_pairs": len(checks), "edges_separated": separated_count,
+        "edges_merged": len(checks) - separated_count,
+    }
+    rows = [{"linear_min": i / 10, "linear_max": (i + 1) / 10, "pixels": int(count)}
+            for i, count in enumerate(histogram)]
+
+    width, height = screen_size(track, cell)
+    display = device_cell.resize((width, height), Image.Resampling.NEAREST)
+    draw = ImageDraw.Draw(display)
+    scale_x = width / max(1, x1 - x0)
+    scale_y = height / max(1, band.height)
+    for number, check in enumerate(checks, 1):
+        if check["frame"] != index + 1:
+            continue
+        points = check["points"]
+        coords = [(round(u * width), round(v * height)) for u, v in points]
+        color = (34, 139, 92) if check["separated"] else (190, 57, 34)
+        if len(coords) == 2:
+            draw.line([coords[0], coords[1]], fill=color, width=3)
+        for cx, cy in coords:
+            draw.ellipse((cx - 7, cy - 7, cx + 7, cy + 7), outline="white", width=4)
+            draw.ellipse((cx - 6, cy - 6, cx + 6, cy + 6), outline=color, width=3)
+            draw.text((cx + 9, cy - 8), str(number), fill=color)
+    return display, summary, rows, None, {"checks": checks}
 
 
 def scale_target(draft, track, source):
@@ -172,22 +231,41 @@ RENDERERS = {
 }
 
 
-def render(mode, draft, library):
+def render_full(mode, draft, library):
+    """Render and additionally return an extra-evidence dict (edge checks)."""
     if mode == "scan":
         sample = draft["scan"]
         picture = raster.decode(library.blob(sample["blob"]).read_bytes())
-        return *scan.extract(picture, sample["registration"], draft["settings"]["threshold"]), None
+        image, summary, rows = scan.extract(
+            picture, sample["registration"], draft["settings"]["threshold"])
+        return image, summary, rows, None, {}
     track = layout.uniform_track(len(draft["frames"]), draft["settings"])
 
     def source(frame):
         return raster.decode(library.blob(frame["blob"]).read_bytes())
 
-    return RENDERERS[mode](draft, track, source)
+    result = RENDERERS[mode](draft, track, source)
+    if len(result) == 5:
+        image, summary, rows, dpi, extra = result
+        return image, summary, rows, dpi, extra or {}
+    image, summary, rows, dpi = result
+    return image, summary, rows, dpi, {}
 
 
-def header(mode, draft, summary, rows, size, dpi):
+def render(mode, draft, library):
+    """Backward compatible four-tuple renderer."""
+    image, summary, rows, dpi, _extra = render_full(mode, draft, library)
+    return image, summary, rows, dpi
+
+
+def header(mode, draft, summary, rows, size, dpi, extra=None):
+    extra = extra or {}
+    checks = extra.get("checks", [])
     return {
         "mode": mode, "title": PROOF_MODES[mode], "summary": summary, "rows": rows,
+        "checks": checks,
+        "edge_checks": checks, "mark_checks": checks, "edge_results": checks,
+        "pair_checks": checks, "pairs": checks if mode == "contrast" else [],
         "source_settings": draft["settings"], "frames": draft["frames"], "scan": draft["scan"] if mode == "scan" else None,
         "size": list(size), "dpi": dpi, "project_title": draft["title"], "synthetic": draft["synthetic"],
     }
@@ -199,6 +277,24 @@ def rows_csv(rows):
         writer = DictWriter(output, list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    return output.getvalue().encode()
+
+
+def proof_csv(detail):
+    """Histogram readings followed by the marked-edge inspection table."""
+    output = StringIO(newline="")
+    if detail.get("rows"):
+        writer = DictWriter(output, list(detail["rows"][0]))
+        writer.writeheader()
+        writer.writerows(detail["rows"])
+    checks = detail.get("checks") or []
+    if checks:
+        if output.tell():
+            output.write("\n")
+        fields = ["label", "frame", "status", "separated", "crossings", "tone_a", "tone_b"]
+        writer = DictWriter(output, fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(checks)
     return output.getvalue().encode()
 
 

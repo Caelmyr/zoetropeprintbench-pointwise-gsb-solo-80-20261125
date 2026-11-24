@@ -7,7 +7,7 @@ from flask import Blueprint, Response, jsonify, render_template, request, send_f
 
 from image_lab.validation import Conflict, Invalid
 
-from . import demo, layout, model, proof, raster
+from . import demo, layout, model, proof, raster, separation
 from .store import Library
 
 MAX_DRUM_FRAME_BYTES = 100 * 1024 * 1024
@@ -101,7 +101,17 @@ def install(app, root):
         value = payload()
 
         def change(draft):
-            draft["settings"] = model.settings(value.get("settings", {}), draft["settings"])
+            incoming = value.get("settings", {})
+            draft["settings"] = model.settings(incoming, draft["settings"])
+            tone_source = incoming if isinstance(incoming, dict) else value
+            tones = separation.coerce_tones(tone_source) or separation.coerce_tones(value)
+            if tones is not None:
+                plan = separation.normalize_state(draft.get("separation"), draft)
+                plan["tones"] = [
+                    {"id": "tone-1", "value": tones[0]["value"], "name": "Gray ink 1"},
+                    {"id": "tone-2", "value": tones[1]["value"], "name": "Gray ink 2"},
+                ]
+                draft["separation"] = plan
 
         return jsonify(library.change(key, value.get("revision"), change))
 
@@ -182,20 +192,241 @@ def install(app, root):
 
         def change(draft):
             draft["frames"].remove(model.find(draft["frames"], frame_key, "source frame"))
+            plan = draft.get("separation")
+            if plan:
+                plan["marks"] = [mark for mark in plan.get("marks", [])
+                                 if mark.get("frame") != frame_key]
 
         return jsonify(library.change(key, data.get("revision"), change))
+
+    # ------------------------------------------------------------------
+    # Ink separation: global primaries, assignment, marks and adoption
+    # ------------------------------------------------------------------
+
+    def separation_world(key):
+        draft = library.draft(key)
+        if len(draft["frames"]) < 2:
+            raise Invalid("Load at least two frames to plan a whole-loop separation.")
+        track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+
+        def source(frame):
+            return raster.decode(library.blob(frame["blob"]).read_bytes())
+
+        return draft, track, source
+
+    def current_revision(key, data):
+        """Use the supplied optimistic revision, but tolerate API callers
+        that omit it by writing against the current draft."""
+        revision = (data or {}).get("revision") if isinstance(data, dict) else None
+        if isinstance(revision, str):
+            try:
+                revision = int(revision)
+            except ValueError:
+                revision = None
+        if type(revision) is not int:
+            revision = library.draft(key)["revision"]
+        return revision
+
+    def separation_response(saved):
+        state = separation.public_state(saved)
+        return jsonify(draft=saved, separation=state, plan=state, result=state)
+
+    @api.get("/drafts/<key>/separation")
+    @api.get("/drafts/<key>/ink-separation")
+    @api.get("/drafts/<key>/inks")
+    @api.get("/drafts/<key>/palette")
+    def get_separation(key):
+        draft = library.draft(key)
+        return jsonify(separation=separation.public_state(draft),
+                       revision=draft["revision"])
+
+    @api.put("/drafts/<key>/separation")
+    @api.post("/drafts/<key>/separation")
+    @api.put("/drafts/<key>/inks")
+    @api.post("/drafts/<key>/inks")
+    def save_separation(key):
+        data = request.get_json(silent=True) or {}
+        revision = current_revision(key, data)
+
+        def change(draft):
+            plan = separation.normalize_state(draft.get("separation"), draft)
+            tones = separation.coerce_tones(data)
+            if tones is not None:
+                plan["tones"] = [
+                    {"id": "tone-1", "value": tones[0]["value"], "name": "Gray ink 1"},
+                    {"id": "tone-2", "value": tones[1]["value"], "name": "Gray ink 2"},
+                ]
+            assignment_in = data.get("assignment") if isinstance(data.get("assignment"), dict) else None
+            mapping_in = data.get("mapping") if isinstance(data.get("mapping"), dict) else None
+            if assignment_in is not None:
+                plan["assignment"].update(separation.coerce_assignment(plan, assignment_in))
+            if mapping_in is not None:
+                plan["assignment"].update(separation.coerce_assignment(plan, mapping_in))
+            if isinstance(data.get("locked"), dict):
+                plan["locked"] = separation.coerce_assignment(plan, data["locked"]) or data["locked"]
+            if "adopted" in data:
+                plan["adopted"] = bool(data["adopted"])
+            if data.get("remove_mark"):
+                target = data["remove_mark"]
+                plan["marks"] = [m for m in plan["marks"] if m.get("id") != target]
+            if isinstance(data.get("marks"), list):
+                plan["marks"] = [m for m in data["marks"] if isinstance(m, dict)]
+            if plan.get("swatches"):
+                assignment, edges, marks, summary = separation.evaluate_assignment(
+                    plan, plan["assignment"])
+                plan["assignment"] = assignment
+                plan["edge_view"] = edges
+                plan["mark_preview"] = marks
+                plan["summary"] = summary
+            draft["separation"] = plan
+
+        saved = library.change(key, revision, change)
+        return separation_response(saved)
+
+    @api.post("/drafts/<key>/separation/sample")
+    @api.post("/drafts/<key>/palette/sample")
+    @api.post("/drafts/<key>/inks/sample")
+    def sample_separation(key):
+        data = request.get_json(silent=True) or {}
+        revision = current_revision(key, data)
+        _, track, source = separation_world(key)
+
+        draft = library.draft(key)
+        plan = separation.build_state(draft, track, source, payload=data)
+        if "adopted" in data:
+            plan["adopted"] = bool(data["adopted"])
+
+        def change(saved_draft):
+            saved_draft["separation"] = plan
+
+        saved = library.change(key, revision, change)
+        return separation_response(saved), 201
+
+    @api.post("/drafts/<key>/separation/suggest")
+    @api.post("/drafts/<key>/inks/suggest")
+    def suggest_separation(key):
+        data = request.get_json(silent=True) or {}
+        revision = current_revision(key, data)
+        draft, track, source = separation_world(key)
+
+        plan = separation.normalize_state(draft.get("separation"), draft)
+        tones = separation.coerce_tones(data)
+        if tones is not None:
+            plan["tones"] = [
+                {"id": "tone-1", "value": tones[0]["value"], "name": "Gray ink 1"},
+                {"id": "tone-2", "value": tones[1]["value"], "name": "Gray ink 2"},
+            ]
+        if not plan["swatches"]:
+            plan = separation.build_state(draft, track, source, payload=data, existing=plan)
+        else:
+            assignment, edges, marks, summary = separation.suggest_assignment(plan)
+            plan["assignment"] = assignment
+            plan["edge_view"] = edges
+            plan["mark_preview"] = marks
+            plan["summary"] = summary
+
+        def change(saved_draft):
+            saved_draft["separation"] = plan
+
+        saved = library.change(key, revision, change)
+        return separation_response(saved)
+
+    @api.post("/drafts/<key>/separation/adopt")
+    @api.post("/drafts/<key>/inks/adopt")
+    def adopt_separation(key):
+        data = request.get_json(silent=True) or {}
+        revision = current_revision(key, data)
+        draft, track, source = separation_world(key)
+
+        plan = separation.normalize_state(draft.get("separation"), draft)
+        tones = separation.coerce_tones(data)
+        if tones is not None:
+            plan["tones"] = [
+                {"id": "tone-1", "value": tones[0]["value"], "name": "Gray ink 1"},
+                {"id": "tone-2", "value": tones[1]["value"], "name": "Gray ink 2"},
+            ]
+        if isinstance(data.get("assignment"), dict):
+            plan["assignment"].update(separation.coerce_assignment(plan, data["assignment"]))
+        if isinstance(data.get("mapping"), dict):
+            plan["assignment"].update(separation.coerce_assignment(plan, data["mapping"]))
+        if not plan["swatches"]:
+            plan = separation.build_state(draft, track, source, payload=data, existing=plan)
+        elif data.get("resuggest") or not plan.get("assignment"):
+            assignment, edges, marks, summary = separation.suggest_assignment(plan)
+            plan["assignment"] = assignment
+            plan["edge_view"] = edges
+            plan["mark_preview"] = marks
+            plan["summary"] = summary
+        plan["adopted"] = True
+
+        def change(saved_draft):
+            saved_draft["separation"] = plan
+
+        saved = library.change(key, revision, change)
+        return separation_response(saved)
+
+    @api.post("/drafts/<key>/separation/marks")
+    @api.put("/drafts/<key>/separation/marks")
+    @api.post("/drafts/<key>/inks/marks")
+    @api.post("/drafts/<key>/marks")
+    def add_separation_mark(key):
+        data = request.get_json(silent=True) or {}
+        revision = current_revision(key, data)
+        draft, track, source = separation_world(key)
+        payload = data.get("mark") if isinstance(data.get("mark"), dict) else data
+        plan = separation.add_mark(draft.get("separation"), payload, draft, track, source)
+
+        def change(saved_draft):
+            saved_draft["separation"] = plan
+
+        saved = library.change(key, revision, change)
+        return separation_response(saved), 201
+
+    @api.delete("/drafts/<key>/separation/marks/<mark_id>")
+    @api.post("/drafts/<key>/separation/marks/<mark_id>/delete")
+    def delete_separation_mark(key, mark_id):
+        data = request.get_json(silent=True) or {}
+        revision = current_revision(key, data)
+
+        def change(draft):
+            plan = separation.normalize_state(draft.get("separation"), draft)
+            plan["marks"] = [mark for mark in plan["marks"] if mark.get("id") != mark_id]
+            if plan["swatches"]:
+                assignment, edges, marks, summary = separation.evaluate_assignment(
+                    plan, plan["assignment"])
+                plan["assignment"] = assignment
+                plan["edge_view"] = edges
+                plan["mark_preview"] = marks
+                plan["summary"] = summary
+            draft["separation"] = plan
+
+        saved = library.change(key, revision, change)
+        return separation_response(saved)
 
     @api.get("/drafts/<key>/frames/<frame_key>/<view>")
     def frame_asset(key, frame_key, view):
         draft = library.draft(key)
         frame = model.find(draft["frames"], frame_key, "source frame")
         raw = library.blob(frame["blob"])
-        model.option(view, ("thumb", "original", "prepared"), "frame view")
+        model.option(view, ("thumb", "original", "prepared", "ink", "separated"), "frame view")
         if view == "original":
             return send_file(raw, download_name=frame["filename"], as_attachment=True)
         if view == "thumb":
             pixels = raster.decode(raw.read_bytes())
             pixels.thumbnail((190, 210))
+        elif view in ("ink", "separated"):
+            track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+            index = next(index for index, item in enumerate(draft["frames"]) if item["id"] == frame_key)
+            cell = track.cells[index]
+            width, height = proof.screen_size(track, cell)
+            plan = separation.normalize_state(draft.get("separation"), draft)
+            if plan.get("swatches") and plan.get("assignment"):
+                pixels = separation.separated_cell(
+                    raster.decode(raw.read_bytes()), frame, (width, height),
+                    (cell.width, track.height), plan, draft["settings"]["stock"])
+            else:
+                pixels = proof.styled_frame(lambda _: raster.decode(raw.read_bytes()),
+                                            draft, track, index)
         else:
             track = layout.uniform_track(len(draft["frames"]), draft["settings"])
             index = next(index for index, item in enumerate(draft["frames"]) if item["id"] == frame_key)
@@ -248,8 +479,8 @@ def install(app, root):
         if "frame" in data:
             active = model.integer(data["frame"], "proof frame", 0, model.MAX_IMAGES - 1)
             draft["settings"]["proof_frame"] = active
-        image, summary, rows, dpi = proof.render(mode, draft, library)
-        result = proof.header(mode, draft, summary, rows, image.size, dpi)
+        image, summary, rows, dpi, extra = proof.render_full(mode, draft, library)
+        result = proof.header(mode, draft, summary, rows, image.size, dpi, extra)
         result["image"] = library.keep(raster.png(image, dpi))
         updated, saved = library.retain(key, revision, result)
         return jsonify(draft=updated, proof=saved), 201
@@ -267,7 +498,7 @@ def install(app, root):
             return send_file(library.blob(result["image"]), mimetype="image/png", download_name=f"{mode}.png",
                              as_attachment=format == "png")
         if format == "csv":
-            return send_file(BytesIO(proof.rows_csv(result["rows"])), mimetype="text/csv", as_attachment=True,
+            return send_file(BytesIO(proof.proof_csv(result)), mimetype="text/csv", as_attachment=True,
                              download_name=f"{mode}.csv")
         return send_file(BytesIO(proof.packet(library, result)), mimetype="application/zip", as_attachment=True,
                          download_name=f"{mode}-evidence.zip")

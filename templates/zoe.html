@@ -56,6 +56,34 @@
             <button class="paper-button">Save drum setup</button>
           </form>
         </details>
+        <details id="separationPanel" open>
+          <summary>Ink separation · 分墨建议</summary>
+          <div id="inkPanel" class="stack ink-panel">
+            <p class="ink-intro">Two stable gray ink levels on top of the paper. Sample the recurring loop colours, assign each primary to one level for every frame, then adopt before printing.</p>
+            <div class="fields">
+              <label>Gray ink 1 (0–255)
+                <input id="grayLevel1" name="gray_level_1" type="number" min="0" max="255" step="1" value="186" data-testid="gray-level-1">
+              </label>
+              <label>Gray ink 2 (0–255)
+                <input id="grayLevel2" name="gray_level_2" type="number" min="0" max="255" step="1" value="82" data-testid="gray-level-2">
+              </label>
+            </div>
+            <div class="ink-actions">
+              <button type="button" id="sampleColors" class="paper-button" data-testid="sample-colors">Sample loop colors · 取样原色</button>
+              <button type="button" id="suggestSeparation" class="paper-button" data-testid="suggest-separation">Suggest assignment · 分墨建议</button>
+            </div>
+            <div id="swatchList" class="swatch-list" data-testid="swatch-list" hidden></div>
+            <p id="separationStats" class="separation-stats" data-testid="separation-stats"></p>
+            <div class="mark-tools">
+              <button type="button" id="markPair" class="paper-button" aria-pressed="false" data-testid="mark-pair">Mark adjacent pair on artwork · 点相邻色</button>
+              <button type="button" id="clearMarks" class="quiet" data-testid="clear-marks">Clear pairs</button>
+            </div>
+            <p id="markHint" class="mark-hint" hidden>Click the first colour on the current frame, then its adjacent colour. 点击一对相邻的颜色。</p>
+            <ul id="markList" class="mark-list" data-testid="mark-list"></ul>
+            <button type="button" id="adoptSeparation" class="accent" data-testid="adopt-separation">Adopt · apply to Print ribbon · 采用分墨</button>
+            <p id="adoptState" class="adopt-state" data-testid="adopt-state">Not adopted yet — Print ribbon stays full colour.</p>
+          </div>
+        </details>
         <details>
           <summary>Import artwork</summary>
           <form id="importFrame" class="stack">
@@ -120,12 +148,13 @@
                 <button id="runProof" class="accent">Save proof</button>
               </div>
               <p id="modeNote" class="mode-note"></p>
-              <div class="stage">
+              <div class="stage" id="stageBox">
                 <div id="scanStage" hidden>
                   <img id="markedScan" alt="Slot scan to mark" draggable="false">
                   <div id="scanBox"></div>
                 </div>
                 <img id="stageImage" alt="Current drum artwork or saved proof" hidden>
+                <svg id="markOverlay" aria-hidden="true"></svg>
                 <p id="stageEmpty">Import an image or open a sample to see the artwork.</p>
               </div>
               <div class="stage-caption">
@@ -166,6 +195,10 @@
               <div id="resultDetail" hidden>
                 <h3 id="proofTitle"></h3>
                 <dl id="summary"></dl>
+                <div id="proofChecks" class="proof-checks" data-testid="proof-checks" hidden>
+                  <h4>Marked edges on the printed ribbon · 点过的边</h4>
+                  <ul id="checkList"></ul>
+                </div>
                 <div class="downloads">
                   <a id="pngLink" class="paper-button">PNG</a>
                   <a id="csvLink" class="paper-button">CSV</a>
