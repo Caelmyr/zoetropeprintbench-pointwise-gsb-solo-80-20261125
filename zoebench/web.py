@@ -1,16 +1,20 @@
 """Local browser workflow for drum artwork, slot measurements and immutable proofs."""
 
+import time
 from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 
 from flask import Blueprint, Response, jsonify, render_template, request, send_file
 
 from image_lab.validation import Conflict, Invalid
 
-from . import demo, layout, model, proof, raster
+from . import demo, layout, model, proof, raster, stencil, stencil_view
 from .store import Library
 
 MAX_DRUM_FRAME_BYTES = 100 * 1024 * 1024
+PLAN_CACHE = {}
+PLAN_CACHE_LIMIT = 200
 MODE_NOTES = {
     "ribbon": "The artwork band includes the blank gluing tab and printer resolution.",
     "cut-guide": "The separate cut sheet identifies frame centers, boundaries and the gluing flap.",
@@ -24,6 +28,8 @@ MODE_NOTES = {
     "scan": "Read light openings inside the scan rectangle. Orange boxes touch the captured edge.",
     "scale": "Measure the printed 100 mm line with a ruler before cutting.",
     "assembly": "Bring the active ends together as they will look when the tab sits underneath.",
+    "stencil": "Millimetre paper-stencil cut sheet: dark shapes are removed, teal ties stay and registration marks align repeat brushing.",
+    "stencil-brush": "See brushing through the stencil at the original ribbon cell, separating tie-blocked ink from paper that was always blank.",
 }
 
 
@@ -46,6 +52,54 @@ def form_revision():
 def check_revision(draft, revision):
     if type(revision) is not int or revision != draft["revision"]:
         raise Conflict("This drum changed. Reload it before saving.")
+
+
+def plan_parameters(data, draft):
+    settings = draft["settings"]
+    raw_width = data.get("bridge_mm", data.get(
+        "min_bridge_mm", data.get("bridge_width_mm", data.get(
+            "min_bridge_width_mm", data.get("tie_width_mm", data.get(
+                "bridge_width", data.get("min_bridge_width",
+                                        settings.get("bridge_mm", 2.0))))))))
+    params = {
+        "frame": data.get("frame", data.get("frame_index", settings.get("proof_frame", 0))),
+        "frame_id": data.get("frame_id"),
+        "bridge_mm": stencil.bridge_width(raw_width),
+        "marks": data.get("marks", data.get("protect", data.get("protected_marks", data.get("lines")))),
+        "ink_threshold": model.number(data.get("ink_threshold", .5), "ink threshold", .05, .95),
+        "ink_mode": model.option(data.get("ink_mode", "auto"),
+                                 ("auto", "alpha", "dark"), "ink mode"),
+    }
+    if data.get("protect_radius_mm") is not None:
+        params["protect_radius_mm"] = model.number(
+            data["protect_radius_mm"], "protected-line radius (mm)", .3, 12)
+    return params
+
+
+def cache_plan(key, params):
+    plan_id = uuid4().hex
+    PLAN_CACHE[plan_id] = {"key": key, "params": params, "ts": time.time()}
+    if len(PLAN_CACHE) > PLAN_CACHE_LIMIT:
+        stale = sorted(PLAN_CACHE, key=lambda item: PLAN_CACHE[item]["ts"])
+        for old in stale[:len(PLAN_CACHE) - PLAN_CACHE_LIMIT]:
+            PLAN_CACHE.pop(old, None)
+    return plan_id
+
+
+def parameters_for(data, key, library):
+    plan_id = data.get("plan_id")
+    if plan_id:
+        cached = PLAN_CACHE.get(plan_id)
+        if not cached or cached["key"] != key:
+            raise Invalid("This tie layout expired. Plan it again before adopting.")
+        return cached["params"]
+    return plan_parameters(data, library.draft(key))
+
+
+def current_compatibility(draft, record):
+    track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+    index, frame = stencil.resolve_frame(draft, record.get("frame"), record.get("frame_id"))
+    return stencil.compatibility(record, frame, track, track.cells[index])
 
 
 def append_frames(draft, items, library):
@@ -236,18 +290,162 @@ def install(app, root):
         image.thumbnail((1600, 500))
         return Response(raster.png(image), mimetype="image/png")
 
+    # ------------------------------------------------------------------
+    # Reusable paper stencil: plan ties, adopt an edition, check refits.
+    # ------------------------------------------------------------------
+
+    @api.post("/drafts/<key>/stencil/plan")
+    @api.post("/drafts/<key>/stencil/bridges")
+    @api.post("/drafts/<key>/stencil/bridges/plan")
+    @api.post("/drafts/<key>/stencil/bridge-plan")
+    @api.post("/drafts/<key>/stencil/tie-plan")
+    def stencil_plan_route(key):
+        data = request.get_json(silent=True) or {}
+        draft = library.draft(key)
+        track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+        params = plan_parameters(data, draft)
+        plan, _canvas, _ink = stencil.plan_for_draft(draft, track, library, **params)
+        plan_id = cache_plan(key, {k: v for k, v in params.items() if k != "frame_id"}
+                             | {"frame_id": params.get("frame_id")})
+        edition = stencil.adoption_record(plan, draft["revision"])
+        compatibility = None
+        if draft.get("stencil"):
+            compatibility = current_compatibility(draft, draft["stencil"])
+        return jsonify({
+            "plan_id": plan_id,
+            "preview_url": f"/zoe/drafts/{key}/stencil/plans/{plan_id}/image",
+            "plan": edition, "stencil": edition, **edition,
+            "compatibility": compatibility,
+        })
+
+    @api.get("/drafts/<key>/stencil/plans/<plan_id>/image")
+    def stencil_plan_image(key, plan_id):
+        cached = PLAN_CACHE.get(plan_id)
+        if not cached or cached["key"] != key:
+            raise Invalid("This tie preview expired. Plan the stencil again.")
+        draft = library.draft(key)
+        track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+        plan, canvas, ink = stencil.plan_for_draft(draft, track, library, **cached["params"])
+        image = stencil_view.render_plan_preview(canvas, ink, plan, track.pixels_per_mm)
+        return Response(raster.png(image), mimetype="image/png")
+
+    def adopt_stencil_change(key, data):
+        expected = data.get("revision")
+        if expected is not None:
+            expected = model.integer(expected, "the current drum revision", 1, 1_000_000_000)
+        else:
+            expected = library.draft(key)["revision"]
+        params = parameters_for(data, key, library)
+
+        def change(draft):
+            track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+            plan, _c, _i = stencil.plan_for_draft(draft, track, library, **params)
+            draft["stencil"] = stencil.adoption_record(plan, draft["revision"])
+
+        updated = library.change(key, expected, change)
+        compatibility = current_compatibility(updated, updated["stencil"])
+        return updated, compatibility
+
+    @api.post("/drafts/<key>/stencil/adopt")
+    @api.post("/drafts/<key>/stencil")
+    def stencil_adopt(key):
+        data = request.get_json(silent=True) or {}
+        updated, compatibility = adopt_stencil_change(key, data)
+        record = updated["stencil"]
+        return jsonify({**updated, "draft": updated, "stencil": record, "plan": record,
+                        "compatibility": compatibility}), 200
+
+    @api.put("/drafts/<key>/stencil")
+    def stencil_put(key):
+        return stencil_adopt(key)
+
+    @api.get("/drafts/<key>/stencil")
+    def stencil_detail(key):
+        draft = library.draft(key)
+        record = draft.get("stencil")
+        if not record:
+            return jsonify(stencil=None, plan=None, compatibility=None, compatible=None)
+        compatibility = current_compatibility(draft, record)
+        return jsonify(stencil=record, plan=record, compatibility=compatibility,
+                       **{k: compatibility[k] for k in
+                          ("matches", "compatible", "usable", "reusable", "method", "verdict")})
+
+    @api.get("/drafts/<key>/stencil/compatibility")
+    @api.get("/drafts/<key>/stencil/fit")
+    @api.get("/drafts/<key>/stencil/refit")
+    @api.post("/drafts/<key>/stencil/check")
+    @api.post("/drafts/<key>/stencil/refit")
+    def stencil_compatibility(key):
+        draft = library.draft(key)
+        record = draft.get("stencil")
+        if not record:
+            raise Invalid("Adopt a stencil before checking whether the cut sheet still fits.")
+        compatibility = current_compatibility(draft, record)
+        return jsonify(compatibility)
+
+    def adopted_image_response(key, kind, as_png=False):
+        draft = library.draft(key)
+        if not draft.get("stencil"):
+            raise Invalid("Adopt a stencil edition before printing its sheet.")
+
+        def source(frame):
+            return raster.decode(library.blob(frame["blob"]).read_bytes())
+
+        track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+        draft["_stencil_request"] = {}
+        if kind == "brush":
+            image, _summary, _rows, _dpi = proof.stencil_brush(draft, track, source)
+            dpi = track.dpi
+            name = "stencil-brush"
+        else:
+            image, _summary, _rows, dpi = proof.stencil_cut(draft, track, source)
+            dpi = dpi or track.dpi
+            name = "stencil-cut-sheet"
+        if as_png:
+            return send_file(BytesIO(raster.png(image, dpi)), mimetype="image/png",
+                             as_attachment=True, download_name=f"{name}.png")
+        return Response(raster.png(image, dpi), mimetype="image/png")
+
+    @api.get("/drafts/<key>/stencil/sheet.png")
+    def stencil_sheet_png(key):
+        return adopted_image_response(key, "cut", as_png=True)
+
+    @api.get("/drafts/<key>/stencil/brush.png")
+    def stencil_brush_png(key):
+        return adopted_image_response(key, "brush", as_png=True)
+
+    @api.get("/drafts/<key>/stencil/image")
+    def stencil_image(key):
+        kind = request.args.get("view", "cut")
+        model.option(kind, ("cut", "sheet", "brush"), "stencil image view")
+        return adopted_image_response(key, "brush" if kind == "brush" else "cut")
+
     @api.post("/drafts/<key>/proofs")
     def retain_proof(key):
         data = payload()
         draft = library.draft(key)
         revision = data.get("revision")
         check_revision(draft, revision)
-        mode = model.option(data.get("mode"), model.PROOF_MODES, "proof mode")
+        mode = model.option(model.canonical_mode(data.get("mode")), model.PROOF_MODES, "proof mode")
         if mode == "scan" and draft["scan"] is None:
             raise Invalid("Import a slit photograph before measuring openings.")
         if "frame" in data:
             active = model.integer(data["frame"], "proof frame", 0, model.MAX_IMAGES - 1)
             draft["settings"]["proof_frame"] = active
+        if mode in {"stencil", "stencil-brush"} and data.get("adopt"):
+            _params = parameters_for(data, key, library) if (data.get("plan_id") or any(
+                k in data for k in ("bridge_mm", "marks", "protect"))) else None
+
+            def adopt_before_proof(saved):
+                track = layout.uniform_track(len(saved["frames"]), saved["settings"])
+                params = _params or plan_parameters(data, saved)
+                plan, _c, _i = stencil.plan_for_draft(saved, track, library, **params)
+                saved["stencil"] = stencil.adoption_record(plan, saved["revision"])
+
+            draft = library.change(key, revision, adopt_before_proof)
+            revision = draft["revision"]
+        # Pass panel/body stencil options to the renderer without persisting them.
+        draft["_stencil_request"] = data if mode in {"stencil", "stencil-brush", "cut-guide"} else {}
         image, summary, rows, dpi = proof.render(mode, draft, library)
         result = proof.header(mode, draft, summary, rows, image.size, dpi)
         result["image"] = library.keep(raster.png(image, dpi))

@@ -7,7 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import numpy as np
 from PIL import Image, ImageDraw
 
-from . import layout, optics, raster, scan
+from . import layout, optics, raster, stencil, stencil_view, scan
 from .model import PROOF_MODES
 from .store import json_bytes
 
@@ -52,7 +52,184 @@ def ribbon_proof(draft, track, source):
 
 
 def cut_guide(draft, track, source):
-    return layout.cut_guide(track), _print_summary(track), _ribbon_rows(track, draft["frames"]), track.dpi
+    base = layout.cut_guide(track)
+    summary = _print_summary(track)
+    rows = _ribbon_rows(track, draft["frames"])
+    record = draft.get("stencil")
+    if record:
+        sheet, _ink, _mask, _record, _frame = _adopted_sheet(draft, track, source)
+        summary.update(_adopted_summary(record))
+        summary["cut_guide_pages"] = "band guide + adopted stencil sheet"
+    elif _stencil_body(draft) and any(
+            key in _stencil_body(draft) for key in
+            ("bridge_mm", "min_bridge_mm", "bridge_width_mm", "marks", "protect", "stencil")):
+        plan, _canvas, ink, _frame = _requested_plan(draft, track, source)
+        sheet = stencil_view.render_cut_sheet(
+            ink, plan["bridge_mask"], plan, track.pixels_per_mm,
+            title=f"PAPER STENCIL - FRAME {plan['frame'] + 1:02}",
+            subtitle="Cut-guide stencil preview - adopt to retain this edition")
+        summary.update({
+            "stencil_included": True, "stencil_edition": "preview",
+            "stencil_ties": plan["bridge_count"], "stencil_islands": plan["island_count"],
+            "stencil_all_connected": plan["all_connected"],
+        })
+    else:
+        return base, summary, rows, track.dpi
+    gap = track.x(8)
+    combined = Image.new("RGB", (max(base.width, sheet.width), base.height + gap + sheet.height), "white")
+    combined.paste(base, (0, 0))
+    combined.paste(sheet, (0, base.height + gap))
+    return combined, summary, rows, track.dpi
+
+
+def _stencil_body(draft):
+    request = draft.get("_stencil_request")
+    return request if isinstance(request, dict) else {}
+
+
+def _requested_plan(draft, track, source):
+    """Plan from proof-request/body or panel values; never needs the library."""
+    body = _stencil_body(draft)
+    settings = draft["settings"]
+    frame_value = body.get("frame", body.get("frame_index", settings.get("proof_frame", 0)))
+    try:
+        index = int(frame_value)
+    except (TypeError, ValueError):
+        index = settings.get("proof_frame", 0)
+    if "frame_id" in body:
+        index, frame = stencil.resolve_frame(draft, frame_id=body["frame_id"])
+    else:
+        index, frame = stencil.resolve_frame(draft, index)
+    image = source(frame)
+    bridge_mm = body.get("bridge_mm", body.get("min_bridge_mm",
+                         body.get("bridge_width_mm", settings.get("bridge_mm", 2.0))))
+    marks = body.get("marks", body.get("protect", body.get("protected_marks")))
+    plan, canvas, ink = stencil.plan_for_draft(
+        draft, track, None, frame=index, bridge_mm=bridge_mm, marks=marks,
+        protect_radius_mm=body.get("protect_radius_mm"),
+        ink_threshold=float(body.get("ink_threshold", 0.5)),
+        source=image)
+    return plan, canvas, ink, frame
+
+
+def _bridge_rows(bridges):
+    return [
+        {"tie": b["index"] + 1, "width_mm": b["width_mm"], "length_mm": b["length_mm"],
+         "blocked_ink_mm2": b["blocked_ink_mm2"], "angle_deg": b["angle_deg"]}
+        | ({"protected_clash": b.get("protected_hits", 0) > 0})
+        for b in bridges
+    ]
+
+
+def _adopted_summary(record):
+    return {
+        "stencil_frame": record["frame"] + 1,
+        "stencil_ties": len(record.get("bridges", [])),
+        "stencil_islands": record.get("island_count", 0),
+        "stencil_tie_width_mm": record.get("bridge_mm"),
+        "stencil_blocked_ink_mm2": record.get("blocked_ink_mm2"),
+        "stencil_all_connected": record.get("all_connected"),
+    }
+
+
+def _adopted_sheet(draft, track, source):
+    record = draft["stencil"]
+    index, frame = stencil.resolve_frame(draft, record.get("frame"), record.get("frame_id"))
+    image = source(frame)
+    ppm = track.pixels_per_mm
+    cell_w, cell_h = record["cell_width_mm"], record["cell_height_mm"]
+    width_px, height_px = track.x(cell_w), track.x(cell_h)
+    transform = record["placement"]["transform"]
+    canvas, _placed, _offset = raster.place(image, transform, (width_px, height_px),
+                                            (cell_w, cell_h), None)
+    ink_mode = stencil.resolve_ink_mode(image, record.get("ink_mode", "auto"))
+    ink = stencil.ink_mask(canvas, record.get("ink_threshold", 0.5), ink_mode)
+    mask = stencil.bridge_mask_from_record(record, ppm, ink.shape)
+    title = f"PAPER STENCIL - FRAME {index + 1:02}"
+    subtitle = f"{record.get('frame_title', '')[:48]} · adopted rev {record.get('adopted_revision')}"
+    sheet = stencil_view.render_cut_sheet(
+        ink, mask, record, ppm, title=title, subtitle=subtitle,
+        protected=record.get("protected_lines"))
+    return sheet, ink, mask, record, frame
+
+
+def stencil_cut(draft, track, source):
+    body = _stencil_body(draft)
+    record = draft.get("stencil")
+    explicit = any(key in body for key in
+                   ("bridge_mm", "min_bridge_mm", "bridge_width_mm", "marks", "protect"))
+    if record and not explicit and not body.get("replanned"):
+        sheet, _ink, _mask, record, _frame = _adopted_sheet(draft, track, source)
+        summary = {**_print_summary(track), **_adopted_summary(record), "stencil_edition": "adopted"}
+        return sheet, summary, _bridge_rows(record.get("bridges", [])), track.dpi
+
+    plan, canvas, ink, _frame = _requested_plan(draft, track, source)
+    sheet = stencil_view.render_cut_sheet(
+        ink, plan["bridge_mask"], plan, track.pixels_per_mm,
+        title=f"PAPER STENCIL - FRAME {plan['frame'] + 1:02}",
+        subtitle="Preview tie layout - adopt this edition to keep it")
+    summary = {
+        **_print_summary(track),
+        "stencil_edition": "preview",
+        "stencil_ties": plan["bridge_count"],
+        "stencil_islands": plan["island_count"],
+        "stencil_tie_width_mm": plan["actual_width_mm"],
+        "stencil_blocked_ink_mm2": plan["blocked_ink_mm2"],
+        "stencil_blocked_fraction": plan["blocked_fraction"],
+        "stencil_all_connected": plan["all_connected"],
+    }
+    return sheet, summary, _bridge_rows(plan["bridges"]), track.dpi
+
+
+def stencil_brush(draft, track, source):
+    body = _stencil_body(draft)
+    record = draft.get("stencil")
+    if record and not any(key in body for key in ("bridge_mm", "marks", "protect")):
+        index, frame = stencil.resolve_frame(draft, record.get("frame"), record.get("frame_id"))
+        ppm = track.pixels_per_mm
+        cell = track.cells[index]
+        image = source(frame)
+        width_px, height_px = track.x(cell.width), track.x(track.height)
+        canvas, _ = stencil.canvas_for_image(
+            image, frame["transform"], width_px, height_px, cell.width, track.height)
+        ink_mode = stencil.resolve_ink_mode(image, record.get("ink_mode", "auto"))
+        ink = stencil.ink_mask(canvas, record.get("ink_threshold", 0.5), ink_mode)
+        mask = stencil.bridge_mask_from_record(record, ppm, ink.shape)
+        compat = stencil.compatibility(record, frame, track, cell)
+        bridges = record.get("bridges", [])
+    else:
+        plan, _canvas, ink, frame = _requested_plan(draft, track, source)
+        index = plan["frame"]
+        cell = track.cells[index]
+        mask = plan["bridge_mask"]
+        compat = None
+        bridges = plan["bridges"]
+
+    stock = raster.PAPER[draft["settings"]["stock"]]
+    ribbon = layout.picture_ribbon(track, draft["frames"], source, draft["settings"]["stock"])
+    paint = body.get("paint")
+    paint_rgb = stencil_view.st.PAINT_DEFAULT
+    if isinstance(paint, str) and paint.startswith("#") and len(paint) == 7:
+        try:
+            paint_rgb = tuple(int(paint[i:i + 2], 16) for i in (1, 3, 5))
+        except ValueError:
+            paint_rgb = stencil_view.st.PAINT_DEFAULT
+    image, areas = stencil_view.render_brush_proof(
+        ribbon, cell, track, ink, mask, stock=stock, paint=paint_rgb)
+    summary = {
+        "frame": index + 1, **areas,
+        "ties": len(bridges),
+        "tie_blocked_ink_mm2": areas["bridge_blocked_ink_mm2"],
+    }
+    if compat:
+        summary.update({
+            "stencil_matches": compat["matches"],
+            "stencil_reusable": compat["reusable"],
+            "stencil_method": compat["method"],
+            "stencil_message": compat["message"],
+        })
+    rows = _bridge_rows(bridges)
+    return image, summary, rows, None
 
 
 def slot_ruler(draft, track, source):
@@ -169,6 +346,9 @@ RENDERERS = {
     "ribbon": ribbon_proof, "cut-guide": cut_guide, "slot-ruler": slot_ruler, "direct-loop": direct_loop,
     "optical-loop": optical_loop, "neighbors": neighbors, "coverage": coverage, "motion": motion,
     "contrast": contrast, "scale": scale_target, "assembly": assembly,
+    "stencil": stencil_cut, "stencil-cut": stencil_cut, "stencil-guide": stencil_cut,
+    "stencil_bridges": stencil_cut,
+    "stencil-brush": stencil_brush, "stencil-proof": stencil_brush, "stencil_brush": stencil_brush,
 }
 
 

@@ -2,6 +2,7 @@ const ui = id => document.getElementById(id);
 const desk = {
   config: null, draft: null, active: null, record: null, crop: null,
   drawing: null, playback: null, busy: false,
+  stencilMarks: [], stencilMarking: false, stencil: null, stencilCompat: null,
 };
 
 async function ask(path, method = 'GET', value = null) {
@@ -47,6 +48,10 @@ function draftPath() {
   return '/drafts/' + desk.draft.id;
 }
 
+function zoeDraftUrl(suffix) {
+  return '/zoe' + draftPath() + suffix;
+}
+
 function framePath(id, mode) {
   return '/zoe' + draftPath() + '/frames/' + id + '/' + mode + '?revision=' + desk.draft.revision;
 }
@@ -83,10 +88,13 @@ function shown(value) {
 function showImage(src, alt, note) {
   ui('scanStage').hidden = true;
   ui('stageEmpty').hidden = true;
-  ui('stageImage').src = src;
-  ui('stageImage').alt = alt;
-  ui('stageImage').hidden = false;
+  const image = ui('stageImage');
+  image.removeAttribute('data-cell');
+  image.src = src;
+  image.alt = alt;
+  image.hidden = false;
   ui('stageName').textContent = note;
+  requestAnimationFrame(positionMarkLayer);
 }
 
 function stopPlayback() {
@@ -111,6 +119,8 @@ function frameStage() {
   }
   const mode = desk.draft.frames.length > 1 ? 'prepared' : 'thumb';
   showImage(framePath(frame.id, mode), frame.title, frame.title + ' · current artwork');
+  ui('stageImage').dataset.cell = '1';
+  requestAnimationFrame(positionMarkLayer);
 }
 
 function renderFrames() {
@@ -136,6 +146,7 @@ function renderFrames() {
       for (const other of ui('frames').children) other.setAttribute('aria-pressed', String(other === button));
       renderAdjustment(item);
       frameStage();
+      if (typeof loadAdoptedMarks === 'function') loadAdoptedMarks();
     });
     return button;
   }));
@@ -177,6 +188,7 @@ function renderDraft(draft, preserveFrame = true) {
   renderFrames();
   renderArchive();
   frameStage();
+  refreshStencilState();
   history.replaceState({}, '', '/?drum=' + draft.id);
 }
 
@@ -391,17 +403,7 @@ on('play', 'click', () => {
 on('mode', 'change', () => {
   ui('modeNote').textContent = desk.config.modes[ui('mode').value].note;
 });
-on('runProof', 'click', async () => {
-  stopPlayback();
-  notice('Rendering the proof…');
-  const mode = ui('mode').value;
-  const saved = await ask(draftPath() + '/proofs', 'POST', {
-    mode, revision: desk.draft.revision, frame: Math.max(0, currentFrame()),
-  });
-  desk.draft = saved.draft;
-  setProof(saved.proof);
-  notice('Saved ' + saved.proof.title.toLowerCase() + '.');
-});
+on('runProof', 'click', runProofClick);
 on('proofHistory', 'change', async () => {
   const id = ui('proofHistory').value;
   if (id) setProof(await ask(draftPath() + '/proofs/' + id));
@@ -410,6 +412,288 @@ on('proofHistory', 'change', async () => {
     frameStage();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Paper stencil: thin-line marks, tie planning, adoption and refit checks.
+// ---------------------------------------------------------------------------
+
+function cellDimensionsMm() {
+  const count = Math.max(1, desk.draft.frames.length || 1);
+  return {
+    w: Number(desk.draft.settings.circumference) / count,
+    h: Number(desk.draft.settings.height_mm),
+  };
+}
+
+function marksToMm() {
+  const cell = cellDimensionsMm();
+  return desk.stencilMarks.map(mark => [
+    Number((mark.u * cell.w).toFixed(2)),
+    Number((mark.v * cell.h).toFixed(2)),
+  ]);
+}
+
+function imageContentRect(img) {
+  const box = img.getBoundingClientRect();
+  const naturalW = img.naturalWidth || Number(img.width) || box.width;
+  const naturalH = img.naturalHeight || Number(img.height) || box.height;
+  const scale = Math.min(box.width / naturalW, box.height / naturalH);
+  const width = naturalW * scale;
+  const height = naturalH * scale;
+  return {
+    left: box.left + (box.width - width) / 2,
+    top: box.top + (box.height - height) / 2,
+    width, height,
+  };
+}
+
+function positionMarkLayer() {
+  const layer = ui('markLayer');
+  const img = ui('stageImage');
+  if (!desk.draft || img.hidden || !img.naturalWidth) {
+    layer.style.width = '0';
+    layer.style.height = '0';
+    return;
+  }
+  const content = imageContentRect(img);
+  const stageRect = ui('stageBox').getBoundingClientRect();
+  layer.style.left = (content.left - stageRect.left - ui('stageBox').clientLeft) + 'px';
+  layer.style.top = (content.top - stageRect.top - ui('stageBox').clientTop) + 'px';
+  layer.style.width = content.width + 'px';
+  layer.style.height = content.height + 'px';
+}
+
+function renderMarks() {
+  const layer = ui('markLayer');
+  layer.replaceChildren();
+  layer.style.display = desk.stencilMarking ? 'block' : 'none';
+  positionMarkLayer();
+  if (desk.stencilMarking) {
+    desk.stencilMarks.forEach((mark, index) => {
+      const dot = document.createElement('button');
+      dot.type = 'button';
+      dot.className = 'mark-dot';
+      dot.textContent = String(index + 1);
+      dot.style.left = (mark.u * 100) + '%';
+      dot.style.top = (mark.v * 100) + '%';
+      dot.title = 'Protected line ' + (index + 1) + ' - click to remove';
+      dot.setAttribute('aria-label', 'Remove protected line mark ' + (index + 1));
+      dot.addEventListener('click', event => {
+        event.stopPropagation();
+        desk.stencilMarks.splice(index, 1);
+        renderMarks();
+      });
+      layer.appendChild(dot);
+    });
+  }
+
+  const chips = ui('stencilMarks');
+  chips.replaceChildren(...desk.stencilMarks.map((mark, index) => {
+    const chip = document.createElement('span');
+    chip.className = 'mark-chip';
+    const cell = cellDimensionsMm();
+    chip.textContent = `L${index + 1} · ${(mark.u * cell.w).toFixed(1)},${(mark.v * cell.h).toFixed(1)} mm`;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', 'Remove mark ' + (index + 1));
+    remove.addEventListener('click', () => {
+      desk.stencilMarks.splice(index, 1);
+      renderMarks();
+    });
+    chip.append(remove);
+    return chip;
+  }));
+}
+
+function setMarking(enabled) {
+  desk.stencilMarking = enabled;
+  ui('stencilMark').setAttribute('aria-pressed', String(enabled));
+  ui('stencilMark').textContent = enabled
+    ? 'Marking… click the thin lines · 点按细线中'
+    : 'Mark thin lines to protect · 点选要保住的细线';
+  ui('stencilMarkHint').hidden = !enabled;
+  ui('stageBox').classList.toggle('marking', enabled);
+  if (enabled) {
+    stopPlayback();
+    frameStage();
+  }
+  requestAnimationFrame(() => { positionMarkLayer(); renderMarks(); });
+}
+
+function onStageImageClick(event) {
+  if (!desk.stencilMarking) return;
+  const img = ui('stageImage');
+  if (img.hidden || img.dataset.cell !== '1') {
+    frameStage();
+    notice('Showing the selected frame - click on its thin lines to protect.');
+    return;
+  }
+  const rect = imageContentRect(img);
+  const u = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+  const v = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
+  desk.stencilMarks.push({ u, v });
+  renderMarks();
+}
+
+function stencilRequestBody(extra = {}) {
+  return {
+    revision: desk.draft.revision,
+    frame: Math.max(0, currentFrame()),
+    bridge_mm: parseFloat(ui('stencilBridge').value) || 2,
+    marks: marksToMm(),
+    ...extra,
+  };
+}
+
+function renderStencilStats(edition, adopted) {
+  if (!edition) {
+    ui('stencilStats').textContent = '';
+    return;
+  }
+  const ties = edition.bridge_count ?? (edition.bridges || []).length;
+  const islands = edition.island_count ?? (edition.islands || []).length;
+  const width = edition.actual_width_mm || edition.bridge_mm;
+  ui('stencilStats').textContent =
+    (adopted ? '已采用 Adopted · ' : '预览 Preview · ') +
+    `${islands} enclosed paper island(s), ${ties} tie(s) at ≥ ${width} mm; ` +
+    `${edition.blocked_ink_mm2 ?? 0} mm² original ink covered by ties` +
+    (edition.all_connected ? '; every island has a wide path out.' : '; connectivity check did not pass.');
+}
+
+function compatClass(compat) {
+  if (!compat) return '';
+  if (compat.matches) return 'ok';
+  if (compat.usable) return 'warn';
+  return 'bad';
+}
+
+function renderCompat(compat) {
+  desk.stencilCompat = compat;
+  const box = ui('stencilCompat');
+  if (!compat) {
+    box.className = 'stencil-compat';
+    box.textContent = '';
+    return;
+  }
+  box.className = 'stencil-compat show ' + compatClass(compat);
+  const verdict = {
+    fits: '完全对位，可直接用',
+    registered: '完全对位，可直接用',
+    translate: '可平移后继续用',
+    'mirror-reversible': '可翻面（镜像）使用',
+    'flip-over': '翻面（镜像）后可用',
+    'flip-over-translate': '翻面并平移后可用',
+    resized: '缩放后不能沿用，需重新切',
+    'scale-mismatch': '缩放后不能沿用，需重新切',
+    'cell-resized': '格尺寸已变，需重新对位或重切',
+    'wrong-frame': '这是另一格的纸模',
+    incompatible: '不能沿用，需重新切',
+  }[compat.verdict] || compat.verdict;
+  box.textContent = `旧纸模对新画位：${verdict}. ${compat.message || ''}`;
+}
+
+function loadAdoptedMarks() {
+  const record = desk.draft?.stencil;
+  if (record && record.frame_id === desk.draft.frames[currentFrame()]?.id &&
+      Array.isArray(record.marks) && record.marks.length) {
+    const cell = cellDimensionsMm();
+    desk.stencilMarks = record.marks.map(([x, y]) => ({ u: x / cell.w, v: y / cell.h }));
+  } else {
+    desk.stencilMarks = [];
+  }
+  renderMarks();
+}
+
+async function refreshStencilState() {
+  desk.stencil = desk.draft?.stencil || null;
+  if (desk.stencil?.bridge_mm) ui('stencilBridge').value = desk.stencil.bridge_mm;
+  loadAdoptedMarks();
+  if (desk.stencil) {
+    renderStencilStats(desk.stencil, true);
+    try {
+      const compat = await ask(draftPath() + '/stencil/compatibility');
+      renderCompat(compat);
+    } catch {
+      renderCompat(null);
+    }
+  } else {
+    renderStencilStats(null, false);
+    renderCompat(null);
+  }
+}
+
+on('stencilMark', 'click', () => setMarking(!desk.stencilMarking));
+on('clearMarks', 'click', async () => {
+  desk.stencilMarks = [];
+  renderMarks();
+});
+ui('stageImage').addEventListener('click', onStageImageClick);
+ui('stageImage').addEventListener('load', () => requestAnimationFrame(positionMarkLayer));
+window.addEventListener('resize', () => requestAnimationFrame(positionMarkLayer));
+
+on('stencilPlan', 'click', async () => {
+  stopPlayback();
+  notice('Planning minimum-width ties…');
+  const plan = await ask(draftPath() + '/stencil/plan', 'POST', stencilRequestBody());
+  desk.stencilPlan = plan;
+  renderStencilStats(plan, false);
+  showImage(plan.preview_url + '?v=' + desk.draft.revision,
+    'Planned stencil ties', 'Tie layout preview · adopt it to keep this edition');
+  notice(`规划完成：${plan.island_count} 个封闭留白，${plan.bridge_count} 条 ≥ ${plan.actual_width_mm} mm 连筋。`);
+});
+
+on('stencilAdopt', 'click', async () => {
+  const result = await ask(draftPath() + '/stencil/adopt', 'POST', stencilRequestBody());
+  renderDraft(result.draft);
+  desk.stencil = result.stencil;
+  renderStencilStats(result.stencil, true);
+  renderCompat(result.compatibility);
+  const url = zoeDraftUrl('/stencil/sheet.png?r=' + result.draft.revision);
+  showImage(url, 'Adopted stencil cut sheet',
+    'Adopted · print via “Print with Cut guide” at 100% or download the sheet');
+  notice('已采用这版纸模。现在可用 Cut guide 按毫米打印纸模与对位记号。');
+});
+
+function requireStencil() {
+  if (!desk.draft?.stencil) {
+    notice('先 Plan tie layout 再 Adopt stencil，然后查看切割图或刷色模拟。', true);
+    return false;
+  }
+  return true;
+}
+
+on('stencilSheet', 'click', async () => {
+  if (!requireStencil()) return;
+  showImage(zoeDraftUrl('/stencil/sheet.png?r=' + desk.draft.revision),
+    'Stencil cut sheet', 'Millimetre cut sheet with ties and paper alignment marks');
+});
+
+on('stencilBrush', 'click', async () => {
+  if (!requireStencil()) return;
+  showImage(zoeDraftUrl('/stencil/brush.png?r=' + desk.draft.revision),
+    'Stencil brush proof', 'Brushing at the original ribbon cell, with bridge-vs-blank diagnostic');
+});
+
+on('stencilCutGuide', 'click', async () => {
+  if (!requireStencil()) return;
+  ui('mode').value = 'cut-guide';
+  ui('modeNote').textContent = desk.config.modes['cut-guide'].note;
+  await runProofClick();
+});
+
+async function runProofClick() {
+  stopPlayback();
+  notice('Rendering the proof…');
+  const mode = ui('mode').value;
+  const saved = await ask(draftPath() + '/proofs', 'POST', {
+    mode, revision: desk.draft.revision, frame: Math.max(0, currentFrame()),
+  });
+  desk.draft = saved.draft;
+  setProof(saved.proof);
+  refreshStencilState();
+  notice('Saved ' + saved.proof.title.toLowerCase() + '.');
+}
 
 (async () => {
   try {

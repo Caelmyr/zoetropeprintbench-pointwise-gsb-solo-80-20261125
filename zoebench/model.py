@@ -21,7 +21,24 @@ PROOF_MODES = {
     "scan": "Measured slots",
     "scale": "Print scale target",
     "assembly": "Join check",
+    "stencil": "Stencil cut sheet",
+    "stencil-brush": "Stencil brush proof",
 }
+
+MODE_ALIASES = {
+    "stencil-cut": "stencil",
+    "stencil-guide": "stencil",
+    "stencil-sheet": "stencil",
+    "bridges": "stencil",
+    "tie-guide": "stencil",
+    "stencil-proof": "stencil-brush",
+    "brush": "stencil-brush",
+    "brush-proof": "stencil-brush",
+}
+
+
+def canonical_mode(value):
+    return MODE_ALIASES.get(value, value)
 DEFAULT_SETTINGS = {
     "circumference": 288,
     "height_mm": 47,
@@ -36,6 +53,7 @@ DEFAULT_SETTINGS = {
     "direction": "clockwise",
     "proof_frame": 0,
     "threshold": 0.56,
+    "bridge_mm": 2.0,
 }
 
 
@@ -97,6 +115,11 @@ def find(records, key, label):
 
 def settings(data, current=None):
     source = {**DEFAULT_SETTINGS, **(current or {}), **document(data)}
+    if "bridge_mm" not in data:
+        for alias in ("min_bridge_mm", "bridge_width_mm", "tie_width_mm"):
+            if alias in data and data[alias] is not None:
+                source["bridge_mm"] = data[alias]
+                break
     return {
         "circumference": number(source["circumference"], "drum circumference (mm)", 120, 680),
         "height_mm": number(source["height_mm"], "art height (mm)", 20, 100),
@@ -111,6 +134,7 @@ def settings(data, current=None):
         "direction": option(source["direction"], ("clockwise", "counterclockwise"), "rotation direction"),
         "proof_frame": integer(source["proof_frame"], "proof frame", 0, MAX_IMAGES - 1),
         "threshold": number(source["threshold"], "slot brightness", .1, .95),
+        "bridge_mm": number(source.get("bridge_mm", 2.0), "stencil tie width (mm)", .5, 12),
     }
 
 

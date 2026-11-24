@@ -82,7 +82,7 @@ input[type=checkbox] { min-height: 0; width: 16px; height: 16px; margin: 0; acce
 .stage-toolbar > div { flex: 1; }
 .stage-toolbar select { max-width: 280px; }
 .mode-note { font-size: .78rem; color: var(--muted); margin: .62rem .05rem; min-height: 1.25rem; }
-.stage { min-height: 310px; max-height: 60vh; display: grid; place-content: center; overflow: auto; padding: .8rem; background: #e4e9de; border: 1px solid #d9e4d8; border-radius: 8px; }
+.stage { position: relative; min-height: 310px; max-height: 60vh; display: grid; place-content: center; overflow: auto; padding: .8rem; background: #e4e9de; border: 1px solid #d9e4d8; border-radius: 8px; }
 .stage img { max-width: 100%; max-height: 54vh; display: block; object-fit: contain; }
 #stageEmpty { text-align: center; color: var(--muted); font-size: .9rem; }
 #scanStage { position: relative; cursor: crosshair; user-select: none; touch-action: none; }
@@ -119,6 +119,36 @@ td, th { padding: .43rem .53rem; border-bottom: 1px solid var(--line); }
 td { white-space: nowrap; }
 .status { white-space: normal; color: var(--teal); margin-top: .8rem; font-size: .85rem; }
 .status.error { color: var(--danger); }
+
+/* Paper stencil panel */
+.stencil-box { margin-top: .7rem; }
+.toggle-btn[aria-pressed="true"] { border-color: #7fd1bd; background: #2f5c50; color: #eafff8; }
+.stencil-hint { font-size: .68rem; line-height: 1.5; color: #cfe0d6; background: rgba(0,0,0,.16); border-radius: 6px; padding: .45rem .5rem; }
+.mark-chips { display: flex; flex-wrap: wrap; gap: .3rem; }
+.mark-chip { display: inline-flex; align-items: center; gap: .3rem; font-size: .68rem; font-weight: 700;
+  border: 1px solid #6f9384; background: #27483e; color: #dff3ea; border-radius: 999px; padding: .18rem .55rem; }
+.mark-chip button { all: unset; cursor: pointer; color: #9fd8c6; font-weight: 900; padding: 0 .1rem; }
+.stencil-actions { display: grid; grid-template-columns: 1fr 1fr; gap: .35rem; }
+.stencil-actions #stencilCutGuide { grid-column: 1 / -1; }
+.stencil-actions button { width: 100%; margin-top: 0; padding: .5rem .4rem; font-size: .72rem; white-space: normal; }
+.stencil-stats { font-size: .72rem; line-height: 1.55; color: #e7f0e9; min-height: 1rem; }
+.stencil-compat { font-size: .72rem; line-height: 1.5; border-radius: 7px; padding: .5rem .55rem; display: none; }
+.stencil-compat.show { display: block; }
+.stencil-compat.ok { background: #244d40; border: 1px solid #4d8a73; color: #dff6ea; }
+.stencil-compat.warn { background: #5a441d; border: 1px solid #c79a45; color: #ffecc6; }
+.stencil-compat.bad { background: #55281c; border: 1px solid #c96a4c; color: #ffe0d4; }
+
+/* Click-to-mark thin lines over the stage image */
+#markLayer { position: absolute; pointer-events: none; z-index: 5; }
+.mark-dot {
+  position: absolute; transform: translate(-50%, -50%); pointer-events: auto;
+  width: 26px; height: 26px; border-radius: 50%; border: 2px solid #fff;
+  background: rgba(53, 97, 153, .92); color: #fff; font-size: .78rem; font-weight: 900;
+  display: grid; place-items: center; padding: 0; line-height: 1;
+  box-shadow: 0 1px 5px rgba(0,0,0,.45);
+}
+.mark-dot:hover { background: var(--danger); }
+.stage.marking #stageImage { cursor: crosshair; outline: 3px dashed #6fb7ff; outline-offset: 2px; }
 @media(max-width: 1050px) {
   .workspace-grid { grid-template-columns: minmax(0, 1fr); }
   .results dl { grid-template-columns: minmax(0, 1fr) auto; }

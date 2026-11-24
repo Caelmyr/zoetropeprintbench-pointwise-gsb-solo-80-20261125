@@ -21,6 +21,9 @@ def artwork(index, count=8):
     mirror = 1 if cos(turn) >= 0 else -1
     pen.line([(23, 303), (65, 299), (105, 303), (145, 301), (187, 298), (232, 302), (274, 299)],
              fill="#6f7864", width=3)
+    # A hollow reed-leaf loop gives the stencil a real enclosed paper island
+    # and a thin outline worth protecting with tie placement.
+    pen.ellipse((238, 250, 288, 292), outline="#6f7864", width=4)
     pen.ellipse((38, 50, 79, 91), fill="#e8ae4e")
     pen.ellipse((62, 44, 87, 69), fill="#f7cb74")
     pen.line((39, 117, 44, 124, 38, 131), fill="#698575", width=3)
