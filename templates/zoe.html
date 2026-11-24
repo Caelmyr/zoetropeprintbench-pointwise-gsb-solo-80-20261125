@@ -40,6 +40,7 @@
               <label>Printer DPI <input type="number" name="dpi"></label>
               <label>Join tab (mm) <input type="number" step=".1" name="join_mm"></label>
               <label>Quiet margin (mm) <input type="number" step=".1" name="action_margin"></label>
+              <label>Uniform cell width (mm) <input type="number" step=".01" name="cell_width" placeholder="optional" min="8"></label>
               <label>Paper <select name="stock"><option value="ivory">Ivory</option><option value="white">White</option><option value="black">Black</option></select></label>
             </div>
             <details class="subdetails">
@@ -87,6 +88,12 @@
             </div>
             <button class="paper-button">Save scan setup</button>
           </form>
+          <div class="placement-controls">
+            <button id="recommendPlacement" type="button" class="paper-button">Recommend print positions</button>
+            <p id="placementState" class="placement-state">Printing the nominal equal band.</p>
+            <button id="adoptPlacement" type="button" class="accent" hidden>Use measured positions</button>
+            <button id="revertPlacement" type="button" class="quiet" hidden>Back to nominal band</button>
+          </div>
         </details>
       </section>
     </aside>
@@ -159,6 +166,34 @@
             </section>
           </div>
           <aside class="side-work">
+            <section class="placement-panel" id="placementPanel" aria-labelledby="placementTitle" hidden>
+              <div class="panel-title"><h2 id="placementTitle">Measured print positions</h2><span id="placementCount"></span></div>
+              <p id="placementLead" class="placement-lead"></p>
+              <p id="placementBlocked" class="placement-blocked" hidden></p>
+              <div id="placementTable" class="row-block" hidden>
+                <table>
+                  <thead>
+                    <tr><th scope="col">Cell</th><th scope="col">Measured slit</th><th scope="col">Cell center</th><th scope="col">Offset</th><th scope="col">Gap after</th></tr>
+                  </thead>
+                  <tbody id="placementRows"></tbody>
+                </table>
+              </div>
+              <dl id="placementSummary"></dl>
+              <div class="downloads">
+                <a id="placementCsv" class="paper-button" href="#">Placement CSV</a>
+              </div>
+              <details id="placementProjectionDetails">
+                <summary>Projected openings</summary>
+                <div class="row-block">
+                  <table>
+                    <thead>
+                      <tr><th scope="col">Slit</th><th scope="col">Photo center</th><th scope="col">Projected span</th><th scope="col">Width</th></tr>
+                    </thead>
+                    <tbody id="placementProjections"></tbody>
+                  </table>
+                </div>
+              </details>
+            </section>
             <section class="results" aria-labelledby="resultsTitle">
               <h2 id="resultsTitle">Saved proofs</h2>
               <label class="reader" for="proofHistory">Open proof</label>

@@ -31,19 +31,33 @@ def styled_frame(source, draft, track, index):
 
 
 def _print_summary(track):
-    return {
+    summary = {
         "frames": len(track.cells), "wrap_mm": track.circumference, "height_mm": track.height,
         "join_tab_mm": track.join_mm, "cell_pitch_mm": round(track.pitch, 4), "print_dpi": track.dpi,
+        "placement": "measured slots" if track.measured else "nominal band",
     }
+    if track.measured:
+        summary["cell_width_mm"] = round(track.cells[0].width, 4)
+    return summary
 
 
 def _ribbon_rows(track, frames):
-    return [
-        {"frame": cell.number + 1, "artwork": frame["title"], "left_mm": round(cell.start, 4),
-         "right_mm": round(cell.end, 4), "center_mm": round(cell.center, 4), "device_start_x": track.x(cell.start),
-         "device_end_x": track.x(cell.end)}
-        for cell, frame in zip(track.cells, frames, strict=True)
-    ]
+    rows = []
+    for cell, frame in zip(track.cells, frames, strict=True):
+        row = {"frame": cell.number + 1, "artwork": frame["title"], "left_mm": round(cell.start, 4),
+               "right_mm": round(cell.end, 4), "center_mm": round(cell.center, 4),
+               "device_start_x": track.x(cell.start), "device_end_x": track.x(cell.end)}
+        if cell.slot is not None:
+            view = track.views[cell.number]
+            row["assigned_slit"] = cell.slot
+            row["slit_center_mm"] = round(view["projected_center_mm"], 4)
+            row["photo_slit_center_mm"] = round(view["photo_center_mm"], 4)
+            row["center_offset_mm"] = round(cell.center - view["projected_center_mm"], 4)
+            following = track.cells[(cell.number + 1) % len(track.cells)]
+            gap = (following.start - cell.end) % track.circumference
+            row["gap_after_mm"] = round(gap, 4)
+        rows.append(row)
+    return rows
 
 
 def ribbon_proof(draft, track, source):
@@ -58,10 +72,18 @@ def cut_guide(draft, track, source):
 def slot_ruler(draft, track, source):
     settings = draft["settings"]
     image, slots = layout.slot_ruler(track, settings["slot_width"], settings["slot_phase"], settings["direction"])
-    rows = [
-        {"opposite_frame": index + 1, "slot_center_mm": round(center, 4), "slit_mm": width}
-        for index, (center, width) in enumerate(slots)
-    ]
+    if track.measured:
+        rows = [
+            {"cell": index + 1, "slit": row["slot"], "slot_center_mm": round(row["center_mm"], 4),
+             "slit_mm": round(row["width_mm"], 4)}
+            for index, row in enumerate(slots)
+        ]
+    else:
+        rows = [
+            {"opposite_frame": index + 1, "slot_center_mm": round(row["center_mm"], 4),
+             "slit_mm": round(row["width_mm"], 4)}
+            for index, row in enumerate(slots)
+        ]
     summary = {**_print_summary(track), "slot_width_mm": settings["slot_width"], "phase_mm": settings["slot_phase"]}
     return image, summary, rows, track.dpi
 
@@ -172,12 +194,13 @@ RENDERERS = {
 }
 
 
-def render(mode, draft, library):
+def render(mode, draft, library, track=None):
     if mode == "scan":
         sample = draft["scan"]
         picture = raster.decode(library.blob(sample["blob"]).read_bytes())
         return *scan.extract(picture, sample["registration"], draft["settings"]["threshold"]), None
-    track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+    if track is None:
+        track = layout.uniform_track(len(draft["frames"]), draft["settings"])
 
     def source(frame):
         return raster.decode(library.blob(frame["blob"]).read_bytes())
@@ -190,6 +213,7 @@ def header(mode, draft, summary, rows, size, dpi):
         "mode": mode, "title": PROOF_MODES[mode], "summary": summary, "rows": rows,
         "source_settings": draft["settings"], "frames": draft["frames"], "scan": draft["scan"] if mode == "scan" else None,
         "size": list(size), "dpi": dpi, "project_title": draft["title"], "synthetic": draft["synthetic"],
+        "layout": draft.get("layout") if mode != "scan" else None,
     }
 
 
@@ -208,6 +232,13 @@ def packet(library, detail):
         zipfile.writestr("proof.png", library.blob(detail["image"]).read_bytes())
         zipfile.writestr("proof.json", json_bytes(detail))
         zipfile.writestr("readings.csv", rows_csv(detail["rows"]))
+        if detail.get("layout"):
+            placement = detail["layout"]
+            zipfile.writestr("placement.json", json_bytes(placement))
+            scan_blob = placement.get("scan_blob")
+            if scan_blob:
+                zipfile.writestr("scan/" + placement.get("scan_filename", "slots.png"),
+                                 library.blob(scan_blob).read_bytes())
         if detail["scan"]:
             sample = detail["scan"]
             zipfile.writestr("scan/" + sample["filename"], library.blob(sample["blob"]).read_bytes())

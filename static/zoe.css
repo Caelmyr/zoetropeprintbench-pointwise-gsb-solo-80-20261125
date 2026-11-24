@@ -105,6 +105,17 @@ input[type=checkbox] { min-height: 0; width: 16px; height: 16px; margin: 0; acce
 .frame-actions { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .65rem; }
 .frame-actions button { font-size: .75rem; }
 
+.placement-controls { display: grid; gap: .4rem; margin-top: .8rem; border-top: 1px solid #587269; padding-top: .7rem; }
+.placement-state { font-size: .74rem; color: #e7debd; line-height: 1.45; }
+.placement-controls button { width: 100%; }
+.placement-panel { background: var(--cream); border: 1px solid var(--line); border-radius: 12px; padding: .8rem; margin-bottom: 1rem; }
+.placement-lead, .placement-blocked { font-size: .76rem; color: var(--muted); margin: .5rem 0 .7rem; line-height: 1.5; }
+.placement-blocked { color: var(--danger); }
+.placement-panel dl { display: grid; grid-template-columns: 1fr auto; gap: .35rem .5rem; padding-top: .55rem; margin: .65rem 0; border-top: 1px solid var(--line); font-size: .74rem; }
+.placement-panel dt { color: var(--muted); }
+.placement-panel dd { margin: 0; font-variant-numeric: tabular-nums; font-weight: 650; text-align: right; }
+.placement-panel > details { font-size: .76rem; margin-top: .55rem; }
+.placement-panel > details > summary { font-weight: 700; margin-bottom: .45rem; }
 .results h2 { margin-bottom: .6rem; }
 .results h3 { margin-top: .85rem; }
 .results dl { display: grid; grid-template-columns: 1fr auto; gap: .4rem .5rem; padding-top: .62rem; border-top: 1px solid var(--line); font-size: .74rem; }

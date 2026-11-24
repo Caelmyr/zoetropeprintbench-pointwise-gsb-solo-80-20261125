@@ -1,7 +1,7 @@
 const ui = id => document.getElementById(id);
 const desk = {
   config: null, draft: null, active: null, record: null, crop: null,
-  drawing: null, playback: null, busy: false,
+  drawing: null, playback: null, busy: false, placement: null, savedPlacement: null,
 };
 
 async function ask(path, method = 'GET', value = null) {
@@ -154,6 +154,152 @@ function renderAdjustment(frame) {
   ui('later').disabled = currentFrame() >= desk.draft.frames.length - 1;
 }
 
+function renderPlacement(report) {
+  const panel = ui('placementPanel');
+  desk.placement = report;
+  if (!report) {
+    panel.hidden = true;
+    ui('placementState').textContent = desk.savedPlacement?.adopted
+      ? 'Measured print positions are in use.'
+      : 'Printing the nominal equal band.';
+    ui('adoptPlacement').hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const feasible = report.feasible;
+  ui('placementCount').textContent = report.cell_width_mm + ' mm cells';
+  ui('placementLead').textContent = feasible
+    ? 'Each cell center sits inside the projection of its measured opening, '
+      + 'with picture order running from the join.'
+    : 'No printable placement fits these measurements.';
+  ui('placementBlocked').hidden = feasible;
+  ui('placementBlocked').textContent = feasible ? '' : (report.blocked?.message || '');
+  ui('placementTable').hidden = !feasible;
+  ui('adoptPlacement').hidden = !feasible;
+  ui('adoptPlacement').textContent = desk.savedPlacement?.adopted
+    ? 'Replace saved measured positions' : 'Use measured positions';
+  ui('revertPlacement').hidden = !desk.savedPlacement?.adopted;
+  ui('placementCsv').hidden = !feasible;
+  ui('placementCsv').textContent = 'Placement CSV';
+  if (feasible) {
+    const blob = placementCsv(report);
+    ui('placementCsv').href = URL.createObjectURL(blob);
+    ui('placementCsv').download = 'measured-placement.csv';
+  }
+  if (feasible) {
+    ui('placementRows').replaceChildren(...report.cells.map(cell => {
+      const tr = document.createElement('tr');
+      for (const value of [
+        String(cell.cell), String(cell.slot), cell.center_mm.toFixed(2),
+        signed(cell.center_offset_mm) + ' mm', cell.gap_after_mm.toFixed(2) + ' mm',
+      ]) {
+        const td = document.createElement('td');
+        td.textContent = value;
+        tr.append(td);
+      }
+      return tr;
+    }));
+    ui('placementProjections').replaceChildren(...report.projections.map(row => {
+      const tr = document.createElement('tr');
+      for (const value of [
+        String(row.slot), row.photo_center_mm.toFixed(2),
+        row.projected_span_mm.map(v => v.toFixed(2)).join(' – '), row.width_mm.toFixed(2),
+      ]) {
+        const td = document.createElement('td');
+        td.textContent = value;
+        tr.append(td);
+      }
+      return tr;
+    }));
+    const summary = [
+      ['Print placement', 'Measured slots'],
+      ['Measured openings', report.measured_openings],
+      ['Art quiet margin (mm)', report.quiet_margin_mm],
+      ['Picture cells', report.cell_count],
+      ['Cell width (mm)', report.cell_width_mm],
+      ['Widest cell these openings allow (mm)', report.widest_cell_mm],
+      ['Mean center offset (mm)', report.mean_abs_center_offset_mm],
+      ['Largest center offset (mm)', report.maximum_center_offset_mm],
+      ['Narrowest inner gap (mm)', report.internal_gap_min_mm],
+      ['Widest inner gap (mm)', report.internal_gap_max_mm],
+      ['Inner gap spread (mm)', report.internal_gap_range_mm],
+      ['Gap before first cell (mm)', report.join_lead_gap_mm],
+      ['Gap after last cell (mm)', report.gap_after_join_mm],
+      ['Complete openings', report.complete_openings],
+      ['Incomplete openings', report.incomplete_openings],
+    ];
+    ui('placementSummary').replaceChildren(...summary.flatMap(([name, value]) => {
+      const dt = document.createElement('dt');
+      dt.textContent = name;
+      const dd = document.createElement('dd');
+      dd.textContent = shown(value);
+      return [dt, dd];
+    }));
+  } else {
+    ui('placementTable').hidden = true;
+    const detail = [
+      ['Picture cells', report.frame_count],
+      ['Complete openings', report.complete_openings],
+      ['Incomplete openings', report.incomplete_openings],
+      ['Widest cell these openings allow (mm)', report.widest_cell_mm],
+      ['Entered cell width (mm)', report.cell_width_mm],
+    ];
+    ui('placementSummary').replaceChildren(...detail.flatMap(([name, value]) => {
+      const dt = document.createElement('dt');
+      dt.textContent = name;
+      const dd = document.createElement('dd');
+      dd.textContent = shown(value);
+      return [dt, dd];
+    }));
+  }
+  ui('placementState').textContent = feasible
+    ? 'A printable measured placement is ready. Adopt it to print these positions.'
+    : 'The measurements do not allow a printable placement.';
+}
+
+async function refreshPlacement() {
+  if (!desk.draft) return;
+  try {
+    const saved = await ask(draftPath() + '/placement');
+    desk.savedPlacement = saved;
+    ui('revertPlacement').hidden = !saved.adopted;
+    ui('placementCsv').hidden = !saved.adopted;
+    ui('placementPanel').hidden = true;
+    ui('placementState').textContent = saved.adopted
+      ? (saved.stale
+        ? 'A saved measured placement is out of date with this drum. Recommend it again.'
+        : 'Measured print positions are in use: ' + saved.cell_width_mm + ' mm cells.')
+      : 'Printing the nominal equal band.';
+    if (saved.adopted) {
+      ui('placementCsv').href = '/zoe' + draftPath() + '/placement.csv';
+      ui('placementCsv').download = 'measured-placement.csv';
+    }
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+function signed(value) {
+  if (value === null || value === undefined) return '—';
+  const fixed = value.toFixed(2);
+  return value > 0 ? '+' + fixed : fixed;
+}
+
+function placementCsv(report) {
+  const lines = [[
+    'cell', 'start_mm', 'end_mm', 'center_mm', 'assigned_slit', 'photo_slit_center_mm',
+    'projected_center_mm', 'projected_span_mm', 'center_offset_mm', 'gap_after_mm',
+  ].join(',')];
+  for (const cell of report.cells) {
+    lines.push([
+      cell.cell, cell.start_mm, cell.end_mm, cell.center_mm, cell.slot, cell.photo_center_mm,
+      cell.projected_center_mm, cell.projected_span_mm.map(value => value.toFixed(2)).join('–'),
+      cell.center_offset_mm, cell.gap_after_mm,
+    ].join(','));
+  }
+  return new Blob([lines.join('\n') + '\n'], { type: 'text/csv' });
+}
+
 function renderArchive() {
   const saved = [['', 'Open proof'], ...[...desk.draft.proofs].reverse().map(item => [item.id, item.title])];
   options(ui('proofHistory'), saved, desk.record?.id || '');
@@ -176,6 +322,8 @@ function renderDraft(draft, preserveFrame = true) {
   if (draft.scan) fields(ui('register'), draft.scan.registration);
   renderFrames();
   renderArchive();
+  renderPlacement(null);
+  refreshPlacement();
   frameStage();
   history.replaceState({}, '', '/?drum=' + draft.id);
 }
@@ -335,6 +483,28 @@ for (const [form, path, message] of [
   });
 }
 on('showScan', 'click', scanStage);
+on('recommendPlacement', 'click', async () => {
+  notice('Fitting the measured openings…');
+  renderPlacement(await ask(draftPath() + '/placement/recommend', 'POST', {}));
+  notice(desk.placement.feasible
+    ? 'Fit ' + desk.placement.cell_count + ' cells to the measured openings.'
+    : 'The measurements do not allow a printable placement.');
+});
+on('adoptPlacement', 'click', async () => {
+  const report = desk.placement;
+  if (!report || !report.feasible) return;
+  renderDraft(await ask(draftPath() + '/placement', 'POST', {
+    revision: desk.draft.revision, cell_width: report.cell_width_mm,
+  }));
+  renderPlacement(null);
+  notice('Print positions now follow the measured openings. Print ribbon and Slit-view proof use them.');
+});
+on('revertPlacement', 'click', async () => {
+  if (!window.confirm('Print the nominal equal band again instead of the measured positions?')) return;
+  renderDraft(await ask(draftPath() + '/placement', 'DELETE', { revision: desk.draft.revision }));
+  renderPlacement(null);
+  notice('Reverted to the nominal equal band used to build a fresh drum.');
+});
 on('register', 'submit', async event => {
   renderDraft(await ask(draftPath() + '/scan', 'PUT', {
     revision: desk.draft.revision,

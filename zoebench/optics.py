@@ -6,11 +6,12 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from . import raster
-from .layout import ORANGE, TEAL, ordinal_slots
+from .layout import ORANGE, TEAL, view_openings
 
 
 def phase_steps(track, settings, frame):
-    slot_center, slot_width = ordinal_slots(track, settings["slot_width"], settings["slot_phase"])[frame]
+    opening = view_openings(track, settings["slot_width"], settings["slot_phase"])[frame]
+    slot_center, slot_width = opening["center_mm"], opening["width_mm"]
     travel = track.circumference * settings["rpm"] / 60 * settings["exposure_ms"] / 1000
     slit = ((np.arange(9) + .5) / 9 - .5) * slot_width
     shutter = (np.arange(13) + .5) / 13 * travel
@@ -18,6 +19,15 @@ def phase_steps(track, settings, frame):
     opposite = slot_center + track.circumference / 2
     centers = (opposite + slit[:, None] + direction * shutter[None, :]).ravel()
     return centers, travel
+
+
+def _owner(track, position):
+    """Cell index covering each band position, or -1 over a blank gap."""
+    wrapped = np.asarray(position) % track.circumference
+    owners = np.full(wrapped.shape, -1, dtype=int)
+    for cell in track.cells:
+        owners[(wrapped >= cell.start) & (wrapped < cell.end)] = cell.number
+    return owners
 
 
 def continuous_band(image, track):
@@ -34,8 +44,9 @@ def continuous_band(image, track):
 
 def slit_view(image, track, settings, frame):
     band = continuous_band(image, track)
-    columns = max(1, round(band.width * track.pitch / track.circumference))
-    offsets = ((np.arange(columns) + .5) / columns - .5) * track.pitch
+    span = track.cells[frame].width
+    columns = max(1, round(band.width * span / track.circumference))
+    offsets = ((np.arange(columns) + .5) / columns - .5) * span
     centers, travel = phase_steps(track, settings, frame)
     column_samples = (centers[:, None] + offsets) / track.circumference * band.width - .5
     first = np.floor(column_samples).astype(int)
@@ -50,23 +61,29 @@ def slit_view(image, track, settings, frame):
     weights_a /= len(centers)
     integrated = np.einsum("hxc,wx->hwc", values, weights_a, optimize=True)
 
-    frame_centers = np.floor((centers % track.circumference) / track.pitch).astype(int)
-    owners = Counter(map(int, frame_centers))
-    dominant = max(owners, key=lambda value: (owners[value], -value))
-    wear = sum(
-        (np.floor(((center + offsets) % track.circumference) / track.pitch) != frame).sum()
-        for center in centers
-    )
+    owners = _owner(track, centers)
+    shares = Counter(int(value) for value in owners if value >= 0)
+    dominant = max(shares, key=lambda value: (shares[value], -value)) if shares else None
+    uncovered = confused = 0
+    for center in centers:
+        sampled = _owner(track, center + offsets)
+        uncovered += int((sampled < 0).sum())
+        confused += int(((sampled >= 0) & (sampled != frame)).sum())
+    total = len(centers) * columns
+    opening = view_openings(track, settings["slot_width"], settings["slot_phase"])[frame]
     summary = {
         "selected_frame": frame + 1,
-        "dominant_center_frame": dominant + 1,
-        "wrong_frame_area_percent": round(100 * int(wear) / (len(centers) * columns), 3),
+        "assigned_slit": opening["slot"],
+        "slit_center_mm": round(opening["center_mm"], 4),
+        "dominant_center_frame": dominant + 1 if dominant is not None else None,
+        "wrong_frame_area_percent": round(100 * confused / total, 3),
+        "blank_area_percent": round(100 * uncovered / total, 3),
         "travel_mm": round(travel, 3),
-        "slit_width_mm": settings["slot_width"],
+        "slit_width_mm": round(opening["width_mm"], 4),
         "speed_rpm": settings["rpm"],
     }
     counts = [{"center_frame": index + 1, "shutter_share": round(value / len(centers), 5)}
-              for index, value in sorted(owners.items())]
+              for index, value in sorted(shares.items())]
     return raster.rgb_image(raster.encode_linear(integrated)), summary, counts
 
 

@@ -80,4 +80,4 @@ def create(library):
         "width": source.width, "height": source.height,
         "registration": {"crop": [.025, .27, .975, .72], "scan_span_mm": 288, "origin_mm": 0},
     }
-    return library.create("Reed bird · sample drum", model.settings({}), frames, slot_scan, synthetic=True)
+    return library.create("Reed bird · sample drum", model.settings({"cell_width": 32}), frames, slot_scan, synthetic=True)

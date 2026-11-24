@@ -72,7 +72,7 @@ class Library:
             draft = {
                 "id": key, "title": title, "created": now, "updated": now, "revision": 1,
                 "frames": frames or [], "scan": scan, "proofs": [], "settings": settings,
-                "synthetic": synthetic,
+                "layout": None, "synthetic": synthetic,
             }
             atomic_write(self.drafts / (key + ".json"), json_bytes(draft))
             return draft

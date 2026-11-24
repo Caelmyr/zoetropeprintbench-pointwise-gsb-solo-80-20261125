@@ -7,7 +7,7 @@ from flask import Blueprint, Response, jsonify, render_template, request, send_f
 
 from image_lab.validation import Conflict, Invalid
 
-from . import demo, layout, model, proof, raster
+from . import demo, layout, model, placement, proof, raster
 from .store import Library
 
 MAX_DRUM_FRAME_BYTES = 100 * 1024 * 1024
@@ -25,6 +25,10 @@ MODE_NOTES = {
     "scale": "Measure the printed 100 mm line with a ruler before cutting.",
     "assembly": "Bring the active ends together as they will look when the tab sits underneath.",
 }
+PLACEMENT_NOTE = (
+    "Fit one equal-width cell per measured opening, in picture order from the join, with every cell center inside "
+    "the projection of its opening and no cell crossing the join."
+)
 
 
 def payload():
@@ -77,6 +81,7 @@ def install(app, root):
         return jsonify(
             settings=model.DEFAULT_SETTINGS,
             modes={key: {"title": title, "note": MODE_NOTES[key]} for key, title in model.PROOF_MODES.items()},
+            placement_note=PLACEMENT_NOTE,
         )
 
     @api.get("/drafts")
@@ -197,7 +202,13 @@ def install(app, root):
             pixels = raster.decode(raw.read_bytes())
             pixels.thumbnail((190, 210))
         else:
-            track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+            try:
+                track = placement.active_track(draft, library) or layout.uniform_track(
+                    len(draft["frames"]), draft["settings"],
+                )
+            except Invalid:
+                # The frame strip is a preview; stale measured positions are reported on the proofs.
+                track = layout.uniform_track(len(draft["frames"]), draft["settings"])
             index = next(index for index, item in enumerate(draft["frames"]) if item["id"] == frame_key)
             pixels = proof.styled_frame(lambda _: raster.decode(raw.read_bytes()), draft, track, index)
         return Response(raster.png(pixels), mimetype="image/png")
@@ -236,6 +247,68 @@ def install(app, root):
         image.thumbnail((1600, 500))
         return Response(raster.png(image), mimetype="image/png")
 
+    @api.get("/drafts/<key>/placement.csv")
+    def placement_csv(key):
+        draft = library.draft(key)
+        layout_record = draft.get("layout")
+        if layout_record is None:
+            raise Invalid("This drum prints the nominal equal band, so there are no measured positions to download.")
+        rows = placement.rows(layout_record)
+        return send_file(BytesIO(proof.rows_csv(rows)), mimetype="text/csv", as_attachment=True,
+                         download_name="measured-placement.csv")
+
+    @api.get("/drafts/<key>/placement")
+    def current_placement(key):
+        draft = library.draft(key)
+        record = draft.get("layout")
+        if record is None:
+            return jsonify({"adopted": False, "stale": False})
+        stale = placement.stale(draft, record)
+        return jsonify({
+            "adopted": True, "stale": stale, "cell_width_mm": record["cell_width_mm"],
+            "cells": placement.rows(record), "report": record.get("report", {}),
+            "scan_filename": record.get("scan_filename"),
+        })
+
+    @api.post("/drafts/<key>/placement/recommend")
+    def recommend_placement(key):
+        draft = library.draft(key)
+        report = placement.recommendation(draft, library)
+        report["revision"] = draft["revision"]
+        return jsonify(report)
+
+    @api.post("/drafts/<key>/placement")
+    def adopt_placement(key):
+        data = payload()
+        draft = library.draft(key)
+        check_revision(draft, data.get("revision"))
+        report = placement.recommendation(draft, library)
+        if report.get("blocked", {}).get("reason") == "count":
+            raise Invalid(report["blocked"]["message"])
+        if not report.get("feasible"):
+            blocked = report.get("blocked") or {}
+            raise Invalid(blocked.get("message") or "The measured openings cannot take this placement.")
+        width = model.number(data.get("cell_width"), "the recommended cell width", 8, 680)
+        if abs(width - report["cell_width_mm"]) > .01:
+            raise Invalid("The measured openings changed. Recommend the placement again before adopting it.")
+
+        def change(draft):
+            draft["layout"] = placement.record(report, draft)
+            draft["settings"]["cell_width"] = report["cell_width_mm"]
+
+        return jsonify(library.change(key, draft["revision"], change)), 201
+
+    @api.delete("/drafts/<key>/placement")
+    def revert_placement(key):
+        data = payload()
+
+        def change(draft):
+            if draft.get("layout") is None:
+                raise Invalid("This drum already prints the nominal band.")
+            draft["layout"] = None
+
+        return jsonify(library.change(key, data.get("revision"), change))
+
     @api.post("/drafts/<key>/proofs")
     def retain_proof(key):
         data = payload()
@@ -248,7 +321,12 @@ def install(app, root):
         if "frame" in data:
             active = model.integer(data["frame"], "proof frame", 0, model.MAX_IMAGES - 1)
             draft["settings"]["proof_frame"] = active
-        image, summary, rows, dpi = proof.render(mode, draft, library)
+        track = None
+        if mode != "scan":
+            track = placement.active_track(draft, library) or layout.uniform_track(
+                len(draft["frames"]), draft["settings"],
+            )
+        image, summary, rows, dpi = proof.render(mode, draft, library, track)
         result = proof.header(mode, draft, summary, rows, image.size, dpi)
         result["image"] = library.keep(raster.png(image, dpi))
         updated, saved = library.retain(key, revision, result)

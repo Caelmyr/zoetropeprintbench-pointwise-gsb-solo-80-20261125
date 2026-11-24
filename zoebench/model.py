@@ -36,6 +36,7 @@ DEFAULT_SETTINGS = {
     "direction": "clockwise",
     "proof_frame": 0,
     "threshold": 0.56,
+    "cell_width": "",
 }
 
 
@@ -111,7 +112,15 @@ def settings(data, current=None):
         "direction": option(source["direction"], ("clockwise", "counterclockwise"), "rotation direction"),
         "proof_frame": integer(source["proof_frame"], "proof frame", 0, MAX_IMAGES - 1),
         "threshold": number(source["threshold"], "slot brightness", .1, .95),
+        "cell_width": cell_width(source["cell_width"]),
     }
+
+
+def cell_width(value):
+    """Optional uniform picture cell width when using a measured placement."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    return number(value, "picture cell width (mm)", 8, 680)
 
 
 def frame_transform(data, current=None):

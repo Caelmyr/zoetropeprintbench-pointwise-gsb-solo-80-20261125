@@ -20,6 +20,7 @@ class Cell:
     number: int
     start: float
     end: float
+    slot: int | None = None
 
     @property
     def center(self):
@@ -37,6 +38,7 @@ class Track:
     height: float
     dpi: int
     join_mm: float
+    views: tuple | None = None
 
     @property
     def pixels_per_mm(self):
@@ -50,9 +52,12 @@ class Track:
         return self.circumference / len(self.cells)
 
     @property
+    def measured(self):
+        return self.views is not None
+
+    @property
     def exact_image_size(self):
         return self.x(self.circumference + self.join_mm), self.x(self.height)
-
 
 def uniform_track(frame_count, settings):
     if frame_count < 2:
@@ -67,10 +72,21 @@ def uniform_track(frame_count, settings):
     return Track(cells, circumference, settings["height_mm"], settings["dpi"], settings["join_mm"])
 
 
-def ordinal_slots(track, slot_width, phase):
+def view_openings(track, slot_width, phase):
+    """Band position and width of the opening each cell actually looks through."""
+    if track.views:
+        return [
+            {"slot": view["slot"], "center_mm": float(view["photo_center_mm"]),
+             "width_mm": float(view["width_mm"]), "measured": True}
+            for view in track.views
+        ]
     if slot_width >= track.pitch / 2:
         raise Invalid("Viewing slots must be narrower than half the distance between centers.")
-    return [((cell.center - track.circumference / 2 + phase) % track.circumference, slot_width) for cell in track.cells]
+    return [
+        {"slot": index + 1, "center_mm": (cell.center - track.circumference / 2 + phase) % track.circumference,
+         "width_mm": slot_width, "measured": False}
+        for index, cell in enumerate(track.cells)
+    ]
 
 
 def paint_cell(source, frame, track, cell, width, height, stock=None):
@@ -118,7 +134,8 @@ def cut_guide(track):
         center = track.x(cell.center)
         draw.line((left, y_top, left, y_low), fill=SOFT_INK, width=1)
         draw.line((center, 2, center, y_top - 1), fill=TEAL, width=2)
-        draw.text((center, y_low + track.x(2)), str(cell.number + 1), fill=CUT_INK, anchor="mt")
+        label = f"{cell.number + 1} · slit {cell.slot}" if cell.slot is not None else str(cell.number + 1)
+        draw.text((center, y_low + track.x(2)), label, fill=CUT_INK, anchor="mt")
     if track.join_mm:
         start = track.x(track.circumference)
         draw.rectangle((start, y_top, width - 1, y_low), outline=ORANGE, width=2)
@@ -132,14 +149,15 @@ def slot_ruler(track, width_mm, phase, direction):
     draw = ImageDraw.Draw(band)
     y_start, y_end = track.x(4), track.x(17)
     draw.rectangle((0, y_start, band.width - 1, y_end), outline=CUT_INK, width=2)
-    slots = ordinal_slots(track, width_mm, phase)
-    for index, (center, slot) in enumerate(slots):
+    slots = view_openings(track, width_mm, phase)
+    for index, row in enumerate(slots):
+        center, slot = row["center_mm"], row["width_mm"]
         x0, x1 = center - slot / 2, center + slot / 2
         for wrap in (-track.circumference, 0, track.circumference):
             left, right = max(0, track.x(x0 + wrap)), min(band.width, track.x(x1 + wrap))
             if left < right:
                 draw.rectangle((left, y_start, right - 1, y_end), fill=CUT_INK)
-        draw.text((track.x(center), y_end + track.x(1)), str(index + 1), fill=TEAL, anchor="mt")
+        draw.text((track.x(center), y_end + track.x(1)), str(row["slot"]), fill=TEAL, anchor="mt")
     draw.text((4, 2), direction, fill=SOFT_INK)
     return band, slots
 
