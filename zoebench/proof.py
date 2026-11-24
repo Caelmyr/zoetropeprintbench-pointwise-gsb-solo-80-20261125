@@ -5,11 +5,28 @@ from io import BytesIO, StringIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from . import layout, optics, raster, scan
 from .model import PROOF_MODES
 from .store import json_bytes
+
+UNCOVERED_BLUE = (38, 104, 178)
+CUT_RED = (201, 58, 35)
+LEGEND_BG = (252, 249, 238)
+FRINGE_BG = (226, 222, 205)
+
+
+def load_font(size=14):
+    for candidate in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ):
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
 def selected_frame(settings, track):
@@ -17,17 +34,127 @@ def selected_frame(settings, track):
 
 
 def screen_size(track, cell, max_edge=520):
-    scale = max_edge / max(cell.width, track.height)
-    return max(1, round(cell.width * scale)), max(1, round(track.height * scale))
+    return layout.screen_size(track, cell, max_edge)
 
 
-def screen_frame(source, draft, track, index):
+def screen_frame(source, draft, track, index, calibration=True):
     frame, cell = draft["frames"][index], track.cells[index]
-    return layout.paint_cell(source(frame), frame, track, cell, *screen_size(track, cell))[0]
+    return layout.paint_cell(source(frame), frame, track, cell, *screen_size(track, cell),
+                             calibration=calibration)[0]
 
 
-def styled_frame(source, draft, track, index):
-    return raster.on_stock(screen_frame(source, draft, track, index), draft["settings"]["stock"])
+def styled_frame(source, draft, track, index, calibration=True):
+    return raster.on_stock(screen_frame(source, draft, track, index, calibration),
+                           draft["settings"]["stock"])
+
+
+def _hatch_patch(width, height, color, spacing=10):
+    patch = Image.new("RGBA", (max(1, int(width)), max(1, int(height))), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(patch)
+    for x in range(-height, width + height, spacing):
+        draw.line((x, height, x + height, 0), fill=color, width=1)
+    return patch
+
+
+def clipping_map(visible, placed, offset, size, margin_xy, stock, stats):
+    """Cell map with blue 'not photographed' edges and red 'ink cut off' ink."""
+    width, height = size
+    pad = 30
+    legend_h = 78
+    map_w, map_h = width + pad * 2, height + pad * 2 + legend_h
+    base = Image.new("RGB", (map_w, map_h), FRINGE_BG)
+    cell_origin = (pad, pad)
+
+    paper_cell = Image.new("RGBA", (width, height), (*raster.PAPER[stock], 255))
+    paper_cell.alpha_composite(visible)
+    base.paste(paper_cell.convert("RGB"), cell_origin)
+
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    ox, oy = offset
+    px_w, px_h = placed.size
+
+    # Blue: portions of the print cell the source negative rectangle never reaches.
+    blue_fill = (*UNCOVERED_BLUE, 46)
+    blue_hatch = (*UNCOVERED_BLUE, 150)
+    uncovered_rects = []
+    if ox > 0:
+        uncovered_rects.append((0, 0, min(ox, width), height))
+    if ox + px_w < width:
+        uncovered_rects.append((max(0, ox + px_w), 0, width, height))
+    if oy > 0:
+        uncovered_rects.append((0, 0, width, min(oy, height)))
+    if oy + px_h < height:
+        uncovered_rects.append((0, max(0, oy + px_h), width, height))
+    for rect in uncovered_rects:
+        x0, y0 = rect[0] + pad, rect[1] + pad
+        x1, y1 = rect[2] + pad, rect[3] + pad
+        rw, rh = max(0, x1 - x0), max(0, y1 - y0)
+        if rw <= 0 or rh <= 0:
+            continue
+        patch = Image.new("RGBA", (rw, rh), blue_fill)
+        patch.alpha_composite(_hatch_patch(rw, rh, blue_hatch))
+        overlay.alpha_composite(patch, (x0, y0))
+
+    # Red: real artwork/pigment that falls outside the print-cell boundary.
+    weights = raster.artwork_weights(placed)
+    cut_alpha = np.zeros((map_h, map_w), dtype=np.uint8)
+    ys, xs = np.nonzero(weights > .06)
+    if len(xs):
+        canvas_x = xs + ox
+        canvas_y = ys + oy
+        outside = (canvas_x < 0) | (canvas_x >= width) | (canvas_y < 0) | (canvas_y >= height)
+        if outside.any():
+            tx = canvas_x[outside] + pad
+            ty = canvas_y[outside] + pad
+            weight = (np.clip(weights[ys[outside], xs[outside]], 0, 1) * 255).astype(np.uint8)
+            valid = (tx >= 0) & (tx < map_w) & (ty >= 0) & (ty < map_h)
+            cut_alpha[ty[valid], tx[valid]] = np.maximum(weight[valid], 150)
+    if cut_alpha.any():
+        cut_rgba = np.zeros((map_h, map_w, 4), dtype=np.uint8)
+        cut_rgba[..., 0] = CUT_RED[0]
+        cut_rgba[..., 1] = CUT_RED[1]
+        cut_rgba[..., 2] = CUT_RED[2]
+        cut_rgba[..., 3] = cut_alpha
+        red_layer = Image.fromarray(cut_rgba, "RGBA").filter(ImageFilter.MaxFilter(3))
+        base = Image.alpha_composite(base.convert("RGBA"), red_layer)
+
+    # Thick inner edge bars mark which print edges are cutting real artwork.
+    bar = 6
+    edge_alpha = 185
+    edge_keys = (
+        ("ink_cut_left_fraction", (pad, pad, pad + bar, pad + height)),
+        ("ink_cut_right_fraction", (pad + width - bar, pad, pad + width, pad + height)),
+        ("ink_cut_top_fraction", (pad, pad, pad + width, pad + bar)),
+        ("ink_cut_bottom_fraction", (pad, pad + height - bar, pad + width, pad + height)),
+    )
+    for key, rect in edge_keys:
+        if stats.get(key, 0) > .002:
+            od.rectangle(rect, fill=(*CUT_RED, edge_alpha))
+
+    base = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(base)
+
+    # Print-cell boundary and quiet-margin rectangle.
+    draw.rectangle((pad, pad, pad + width - 1, pad + height - 1), outline=(35, 44, 40), width=2)
+    margin_x, margin_y = margin_xy
+    draw.rectangle((pad + margin_x, pad + margin_y, pad + width - margin_x - 1,
+                    pad + height - margin_y - 1), outline=layout.ORANGE, width=2)
+
+    # Legend.
+    small = load_font(13)
+    draw.rectangle((0, map_h - legend_h, map_w, map_h), fill=LEGEND_BG)
+    items = [
+        (UNCOVERED_BLUE, "Not in original photo (uncovered edge)"),
+        (CUT_RED, "Artwork cut by print-cell edge"),
+        (layout.ORANGE, "Quiet margin"),
+    ]
+    y = map_h - legend_h + 9
+    for color, text in items:
+        draw.rectangle((pad, y, pad + 15, y + 15), fill=color)
+        draw.text((pad + 22, y), text, fill=(40, 48, 44), font=small)
+        y += 22
+    return base
 
 
 def _print_summary(track):
@@ -94,21 +221,45 @@ def coverage(draft, track, source):
     overlay = None
     for frame, cell in zip(draft["frames"], track.cells, strict=True):
         size = screen_size(track, cell)
-        visible, aa, offset = layout.paint_cell(source(frame), frame, track, cell, *size)
+        visible, placed, offset = layout.paint_cell(source(frame), frame, track, cell, *size)
         margin = draft["settings"]["action_margin"]
         margin_x = round(margin / cell.width * size[0])
         margin_y = round(margin / track.height * size[1])
-        visible_stats = raster.mask_visibility(aa, offset, size, (margin_x, margin_y))
-        rows.append({"frame": cell.number + 1, **visible_stats})
+        stats = raster.mask_visibility(placed, offset, size, (margin_x, margin_y))
+        px_per_mm_x = size[0] / cell.width
+        px_per_mm_y = size[1] / track.height
+        row = {
+            "frame": cell.number + 1,
+            "ink_fraction": stats["ink_fraction"],
+            "cut_fraction": stats["cut_fraction"],
+            "ink_cut_fraction": stats["ink_cut_fraction"],
+            "quiet_fraction": stats["quiet_fraction"],
+            "uncovered_fraction": stats["uncovered_fraction"],
+            "unphotographed_fraction": stats["uncovered_fraction"],
+            "missing_edge_fraction": stats["uncovered_fraction"],
+            "uncovered_left_mm": round(stats["uncovered_left_px"] / px_per_mm_x, 2),
+            "uncovered_right_mm": round(stats["uncovered_right_px"] / px_per_mm_x, 2),
+            "uncovered_top_mm": round(stats["uncovered_top_px"] / px_per_mm_y, 2),
+            "uncovered_bottom_mm": round(stats["uncovered_bottom_px"] / px_per_mm_y, 2),
+            "cut_left_fraction": stats["cut_left_fraction"],
+            "cut_right_fraction": stats["cut_right_fraction"],
+            "cut_top_fraction": stats["cut_top_fraction"],
+            "cut_bottom_fraction": stats["cut_bottom_fraction"],
+            "ink_cut_left_fraction": stats["ink_cut_left_fraction"],
+            "ink_cut_right_fraction": stats["ink_cut_right_fraction"],
+            "ink_cut_top_fraction": stats["ink_cut_top_fraction"],
+            "ink_cut_bottom_fraction": stats["ink_cut_bottom_fraction"],
+        }
+        rows.append(row)
         if cell.number == index:
-            overlay = raster.on_stock(visible, draft["settings"]["stock"])
-            ImageDraw.Draw(overlay).rectangle(
-                (margin_x, margin_y, size[0] - margin_x - 1, size[1] - margin_y - 1),
-                outline=layout.ORANGE, width=2,
+            overlay = clipping_map(
+                visible, placed, offset, size, (margin_x, margin_y),
+                draft["settings"]["stock"], stats,
             )
     summary = {
         "frames_with_cut_ink": sum(row["cut_fraction"] > .001 for row in rows),
         "frames_with_ink_in_margin": sum(row["quiet_fraction"] > .001 for row in rows),
+        "frames_with_uncovered_edges": sum(row["uncovered_fraction"] > .002 for row in rows),
         "quiet_margin_mm": draft["settings"]["action_margin"],
         "selected_frame": index + 1,
     }

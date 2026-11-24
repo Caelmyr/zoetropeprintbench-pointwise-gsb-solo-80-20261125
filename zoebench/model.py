@@ -8,6 +8,21 @@ from image_lab.validation import Invalid
 
 MAX_IMAGES = 24
 MAX_SAVED_PROOFS = 30
+MAX_REFERENCE_REGIONS = 12
+CALIBRATION_STATUSES = ("off", "reference", "aligned", "limited", "edge-limited", "unresolved", "manual")
+RELIABLE_STATUSES = ("reference", "aligned", "limited", "edge-limited", "manual")
+DEFAULT_CALIBRATION = {
+    "shift_x": 0.0,
+    "shift_y": 0.0,
+    "dx": 0.0,
+    "dy": 0.0,
+    "status": "off",
+    "confidence": None,
+    "score": None,
+    "reason": None,
+    "method": None,
+    "updated": None,
+}
 PROOF_MODES = {
     "ribbon": "Print ribbon",
     "cut-guide": "Cut guide",
@@ -36,6 +51,8 @@ DEFAULT_SETTINGS = {
     "direction": "clockwise",
     "proof_frame": 0,
     "threshold": 0.56,
+    "align_max_shift_mm": 6,
+    "align_edge_tolerance": 0.05,
 }
 
 
@@ -111,6 +128,8 @@ def settings(data, current=None):
         "direction": option(source["direction"], ("clockwise", "counterclockwise"), "rotation direction"),
         "proof_frame": integer(source["proof_frame"], "proof frame", 0, MAX_IMAGES - 1),
         "threshold": number(source["threshold"], "slot brightness", .1, .95),
+        "align_max_shift_mm": number(source["align_max_shift_mm"], "maximum alignment offset (mm)", .25, 25),
+        "align_edge_tolerance": number(source["align_edge_tolerance"], "edge ink tolerance", 0, .25),
     }
 
 
@@ -126,6 +145,109 @@ def frame_transform(data, current=None):
         "matte": option(value["matte"], ("original", "white", "black"), "frame matte"),
         "flip": value["flip"],
     }
+
+
+def calibration_of(frame):
+    """The base negative layer for a frame, tolerating older drafts."""
+    current = frame.get("calibration") if isinstance(frame, dict) else None
+    if not isinstance(current, dict):
+        return dict(DEFAULT_CALIBRATION)
+    return {**DEFAULT_CALIBRATION, **current}
+
+
+def frame_calibration(data, current=None):
+    """Validate the calibration layer. User picture transforms stay separate."""
+    value = {**DEFAULT_CALIBRATION, **(current or {}), **document(data)}
+    status = value.get("status", "off")
+    if status not in CALIBRATION_STATUSES:
+        status = "manual"
+
+    def finite_number(key, label, lower, upper):
+        raw = value.get(key)
+        if raw is None:
+            return 0.0
+        return number(raw, label, lower, upper)
+
+    result = {
+        "shift_x": finite_number("shift_x", "calibration horizontal shift (mm)", -25, 25),
+        "shift_y": finite_number("shift_y", "calibration vertical shift (mm)", -25, 25),
+        "dx": finite_number("dx", "calibration source x fraction", -2, 2),
+        "dy": finite_number("dy", "calibration source y fraction", -2, 2),
+        "status": status,
+        "confidence": None,
+        "score": None,
+        "reason": None,
+        "method": value.get("method") if isinstance(value.get("method"), str) else None,
+        "updated": value.get("updated") if isinstance(value.get("updated"), str) else None,
+    }
+    confidence = value.get("confidence")
+    if confidence is not None:
+        result["confidence"] = number(confidence, "alignment confidence", 0, 1)
+    score = value.get("score")
+    if score is not None:
+        result["score"] = number(score, "alignment score", -2, 2)
+    reason = value.get("reason")
+    if isinstance(reason, str) and len(reason) <= 80:
+        result["reason"] = reason
+    return result
+
+
+def region_box(value):
+    if isinstance(value, dict):
+        if isinstance(value.get("box"), (list, tuple)):
+            value = value["box"]
+        elif isinstance(value.get("rect"), (list, tuple)):
+            value = value["rect"]
+        elif all(key in value for key in ("x", "y", "width", "height")):
+            x, y = float(value["x"]), float(value["y"])
+            value = [x, y, x + float(value["width"]), y + float(value["height"])]
+        elif all(key in value for key in ("left", "top", "right", "bottom")):
+            value = [value["left"], value["top"], value["right"], value["bottom"]]
+        elif isinstance(value.get("bounds"), (list, tuple)):
+            value = value["bounds"]
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise Invalid("Draw each reference mark as a rectangle with four coordinates.")
+    x1, y1, x2, y2 = (number(point, "normalized reference coordinates", -2, 2) for point in value)
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(1, x2), min(1, y2)
+    if x2 - x1 < .004 or y2 - y1 < .004:
+        raise Invalid("Each reference rectangle needs a little width and height.")
+    return [x1, y1, x2, y2]
+
+
+def reference_regions(value):
+    if isinstance(value, dict):
+        value = value.get("regions") or value.get("marks") or value.get("landmarks")
+    if isinstance(value, (list, tuple)) and len(value) == 4 and all(
+            isinstance(point, (int, float)) for point in value):
+        value = [value]
+    if not isinstance(value, list) or not value:
+        raise Invalid("Mark at least one fixed feature, such as the moon or ground line.")
+    if len(value) > MAX_REFERENCE_REGIONS:
+        raise Invalid(f"Use at most {MAX_REFERENCE_REGIONS} reference marks.")
+    regions = []
+    for entry in value:
+        label = None
+        box = entry
+        if isinstance(entry, dict):
+            label = entry.get("label") or entry.get("name")
+            box = entry.get("box") or entry.get("rect") or entry.get("bounds") or entry
+        coords = region_box(box)
+        regions.append({"box": coords, "label": string(label, "reference label", 40) if isinstance(label, str) and label.strip() else None})
+    return regions
+
+
+def max_alignment_shift(data, settings=None):
+    raw = None
+    for key in ("max_shift_mm", "max_offset_mm", "max_shift", "maximum_offset_mm", "limit_mm", "alignment_limit_mm"):
+        if isinstance(data, dict) and data.get(key) is not None:
+            raw = data[key]
+            break
+    if raw is None:
+        raw = (settings or {}).get("align_max_shift_mm", DEFAULT_SETTINGS["align_max_shift_mm"])
+    return number(raw, "maximum alignment offset (mm)", .25, 25)
 
 
 def box(value):

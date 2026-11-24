@@ -2,6 +2,8 @@ const ui = id => document.getElementById(id);
 const desk = {
   config: null, draft: null, active: null, record: null, crop: null,
   drawing: null, playback: null, busy: false,
+  calibrationOn: true, marking: false, markDrawing: null,
+  markRegions: [], planRows: [],
 };
 
 async function ask(path, method = 'GET', value = null) {
@@ -48,7 +50,9 @@ function draftPath() {
 }
 
 function framePath(id, mode) {
-  return '/zoe' + draftPath() + '/frames/' + id + '/' + mode + '?revision=' + desk.draft.revision;
+  let path = '/zoe' + draftPath() + '/frames/' + id + '/' + mode + '?revision=' + desk.draft.revision;
+  if (mode === 'prepared' && !desk.calibrationOn) path += '&cal=0';
+  return path;
 }
 
 function fields(form, value) {
@@ -82,6 +86,7 @@ function shown(value) {
 
 function showImage(src, alt, note) {
   ui('scanStage').hidden = true;
+  ui('alignStage').hidden = true;
   ui('stageEmpty').hidden = true;
   ui('stageImage').src = src;
   ui('stageImage').alt = alt;
@@ -132,8 +137,17 @@ function renderFrames() {
     button.addEventListener('click', () => {
       if (desk.busy) return;
       stopPlayback();
+      desk.marking = false;
+      syncMarkButton();
       desk.active = item.id;
       for (const other of ui('frames').children) other.setAttribute('aria-pressed', String(other === button));
+      if (desk.markRegions.length && desk.draft.alignment?.reference_frame !== item.id) {
+        desk.markRegions = [];
+        renderMarkList();
+      } else if (desk.draft.alignment?.reference_frame === item.id) {
+        desk.markRegions = (desk.draft.alignment.regions || []).map(r => ({ box: [...r.box], label: r.label || '' }));
+        renderMarkList();
+      }
       renderAdjustment(item);
       frameStage();
     });
@@ -146,12 +160,29 @@ function renderFrames() {
 
 function renderAdjustment(frame) {
   ui('frameAdjust').hidden = !frame;
+  ui('calBase').hidden = !frame;
   if (!frame) return;
   ui('frameTitle').textContent = frame.title;
   ui('downloadFrame').href = framePath(frame.id, 'original');
   fields(ui('frameAdjust'), frame.transform);
   ui('earlier').disabled = currentFrame() < 1;
   ui('later').disabled = currentFrame() >= desk.draft.frames.length - 1;
+  renderCalBase(frame);
+}
+
+const CAL_STATUS_TEXT = {
+  off: 'not calibrated', reference: 'reference', aligned: 'aligned',
+  limited: 'at max offset', 'edge-limited': 'edge protected',
+  unresolved: 'no reliable reference', manual: 'manually tuned',
+};
+
+function renderCalBase(frame) {
+  const cal = frame.calibration || { shift_x: 0, shift_y: 0, status: 'off' };
+  ui('calShiftX').value = cal.shift_x ?? 0;
+  ui('calShiftY').value = cal.shift_y ?? 0;
+  const badge = ui('calStatus');
+  badge.textContent = CAL_STATUS_TEXT[cal.status] || cal.status || 'off';
+  badge.dataset.status = cal.status || 'off';
 }
 
 function renderArchive() {
@@ -162,6 +193,7 @@ function renderArchive() {
 function renderDraft(draft, preserveFrame = true) {
   stopPlayback();
   desk.draft = draft;
+  desk.marking = false;
   if (!preserveFrame || currentFrame() < 0) desk.active = draft.frames[0]?.id || null;
   ui('welcome').hidden = true;
   ui('work').hidden = false;
@@ -174,6 +206,18 @@ function renderDraft(draft, preserveFrame = true) {
   ui('register').hidden = !draft.scan;
   desk.crop = draft.scan ? [...draft.scan.registration.crop] : null;
   if (draft.scan) fields(ui('register'), draft.scan.registration);
+  ui('alignMax').value = draft.alignment?.max_shift_mm ?? draft.settings.align_max_shift_mm ?? 6;
+  if (draft.alignment?.reference_frame === desk.active) {
+    desk.markRegions = (draft.alignment.regions || []).map(region => ({
+      box: [...region.box], label: region.label || '',
+    }));
+  } else {
+    desk.markRegions = [];
+  }
+  desk.planRows = draft.alignment_plan?.frames ? draft.alignment_plan.frames.map(row => ({ ...row })) : [];
+  renderMarkList();
+  renderPlan(draft.alignment_plan || null);
+  syncMarkButton();
   renderFrames();
   renderArchive();
   frameStage();
@@ -220,7 +264,8 @@ function renderSummary(detail) {
   }));
   ui('rowBlock').hidden = detail.rows.length === 0;
   if (!detail.rows.length) return;
-  const columnKeys = Object.keys(detail.rows[0]);
+  const hiddenColumns = new Set(['unphotographed_fraction', 'missing_edge_fraction']);
+  const columnKeys = Object.keys(detail.rows[0]).filter(key => !hiddenColumns.has(key));
   const header = document.createElement('tr');
   for (const key of columnKeys) {
     const th = document.createElement('th');
@@ -409,6 +454,349 @@ on('proofHistory', 'change', async () => {
     clearProof();
     frameStage();
   }
+});
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function syncMarkButton() {
+  const button = ui('markRefs');
+  if (!button) return;
+  button.textContent = desk.marking ? 'Finish marking boxes' : 'Mark reference scenery on selected frame';
+  button.classList.toggle('accent', desk.marking);
+  button.setAttribute('aria-pressed', String(desk.marking));
+}
+
+function renderMarkBoxes(rubber = null) {
+  const layer = ui('markLayer');
+  if (!layer) return;
+  layer.replaceChildren();
+  const boxes = rubber ? [...desk.markRegions, { box: rubber, drawing: true }] : desk.markRegions;
+  boxes.forEach((region, index) => {
+    const [x1, y1, x2, y2] = region.box;
+    const box = document.createElement('div');
+    box.className = 'mark-box' + (region.drawing ? ' drawing' : '');
+    Object.assign(box.style, {
+      left: (x1 * 100) + '%', top: (y1 * 100) + '%',
+      width: Math.max(0, (x2 - x1) * 100) + '%', height: Math.max(0, (y2 - y1) * 100) + '%',
+    });
+    if (!region.drawing) {
+      const tag = document.createElement('span');
+      tag.className = 'mark-tag';
+      tag.textContent = region.label || ('Mark ' + (index + 1));
+      box.appendChild(tag);
+    }
+    layer.appendChild(box);
+  });
+}
+
+function renderMarkList() {
+  const list = ui('markList');
+  if (!list) return;
+  list.hidden = desk.markRegions.length === 0;
+  list.replaceChildren(...desk.markRegions.map((region, index) => {
+    const row = document.createElement('div');
+    row.className = 'mark-row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = region.label || ('Mark ' + (index + 1));
+    input.setAttribute('aria-label', 'Label for reference mark ' + (index + 1));
+    input.addEventListener('input', () => {
+      region.label = input.value;
+      renderMarkBoxes();
+    });
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'mark-delete';
+    remove.textContent = '×';
+    remove.title = 'Remove this mark';
+    remove.setAttribute('aria-label', 'Remove mark ' + (index + 1));
+    remove.addEventListener('click', event => {
+      event.stopPropagation();
+      desk.markRegions.splice(index, 1);
+      renderMarkList();
+    });
+    row.append(input, remove);
+    return row;
+  }));
+  renderMarkBoxes();
+}
+
+function markPoint(event) {
+  const rect = ui('alignImage').getBoundingClientRect();
+  return [
+    clamp01((event.clientX - rect.left) / rect.width),
+    clamp01((event.clientY - rect.top) / rect.height),
+  ];
+}
+
+ui('alignStage').addEventListener('pointerdown', event => {
+  if (!desk.marking) return;
+  desk.markDrawing = markPoint(event);
+  ui('alignStage').setPointerCapture(event.pointerId);
+});
+ui('alignStage').addEventListener('pointermove', event => {
+  if (!desk.markDrawing) return;
+  const [startX, startY] = desk.markDrawing;
+  const [endX, endY] = markPoint(event);
+  renderMarkBoxes([Math.min(startX, endX), Math.min(startY, endY),
+    Math.max(startX, endX), Math.max(startY, endY)]);
+});
+function finishMarkDraw(event) {
+  if (!desk.markDrawing) return;
+  const [startX, startY] = desk.markDrawing;
+  const end = event ? markPoint(event) : start;
+  const box = [Math.min(startX, end[0]), Math.min(startY, end[1]),
+    Math.max(startX, end[0]), Math.max(startY, end[1])];
+  desk.markDrawing = null;
+  if (box[2] - box[0] >= .012 && box[3] - box[1] >= .012) {
+    desk.markRegions.push({ box, label: 'Mark ' + (desk.markRegions.length + 1) });
+  }
+  renderMarkList();
+}
+ui('alignStage').addEventListener('pointerup', finishMarkDraw);
+ui('alignStage').addEventListener('pointercancel', () => {
+  desk.markDrawing = null;
+  renderMarkBoxes();
+});
+
+function enterMarking() {
+  const frame = desk.draft?.frames[currentFrame()];
+  if (!frame) {
+    notice('Select a frame before marking scenery.', true);
+    return;
+  }
+  stopPlayback();
+  desk.marking = true;
+  ui('stageImage').hidden = true;
+  ui('scanStage').hidden = true;
+  ui('stageEmpty').hidden = true;
+  ui('alignStage').hidden = false;
+  let source = framePath(frame.id, 'prepared');
+  if (!/cal=0/.test(source)) source += '&cal=0';
+  ui('alignImage').src = source;
+  ui('stageName').textContent = 'Drag boxes around fixed scenery on ' + frame.title + ' — keep the moving bird out.';
+  syncMarkButton();
+  renderMarkBoxes();
+}
+
+const ALIGN_STATUS_TEXT = {
+  reference: 'Reference', aligned: 'Aligned', limited: 'At max offset',
+  'edge-limited': 'Edge protected', unresolved: 'No reliable reference', manual: 'Manual',
+};
+const ALIGN_REASON_TEXT = {
+  weak_reference: 'marked features not recognised in this frame',
+  ambiguous: 'marks disagree with each other',
+  blank_reference: 'reference mark has no detail',
+  max_shift: 'true shift exceeds the maximum offset',
+  edge_protected: 'shift softened to protect edge artwork',
+};
+
+function edgeSummary(row) {
+  if (row.status === 'unresolved') return ALIGN_REASON_TEXT[row.reason] || 'no trustworthy match';
+  const coverage = row.coverage || {};
+  const parts = [];
+  if ((coverage.ink_cut_fraction || 0) > .004) parts.push('cut ' + (coverage.ink_cut_fraction * 100).toFixed(1) + '%');
+  const gap = Math.max(coverage.uncovered_left_mm || 0, coverage.uncovered_right_mm || 0,
+    coverage.uncovered_top_mm || 0, coverage.uncovered_bottom_mm || 0);
+  if (gap > .05) parts.push('uncovered ' + gap.toFixed(1) + ' mm');
+  if (row.status === 'edge-limited') parts.push('edge-capped');
+  if (row.reason === 'max_shift') parts.push('at max');
+  return parts.join(' · ') || 'edge-safe';
+}
+
+function renderPlan() {
+  const panel = ui('alignPlanPanel');
+  const rows = desk.planRows;
+  if (!rows.length) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const summary = desk.draft.alignment_plan?.summary;
+  if (summary) {
+    ui('alignPlanSummary').textContent =
+      summary.reliable + ' reliable · ' + summary.unresolved + ' unresolved · ' + summary.total + ' frames';
+  }
+  const body = ui('alignPlanRows');
+  body.replaceChildren(...rows.map((row) => {
+    const tr = document.createElement('tr');
+    tr.dataset.status = row.status;
+
+    const useCell = document.createElement('td');
+    const use = document.createElement('input');
+    use.type = 'checkbox';
+    use.checked = row.apply !== false;
+    use.setAttribute('aria-label', 'Apply shift to frame ' + (row.index + 1));
+    use.addEventListener('change', () => { row.apply = use.checked; });
+    useCell.appendChild(use);
+
+    const indexCell = document.createElement('td');
+    indexCell.textContent = String(row.index + 1).padStart(2, '0');
+    const titleCell = document.createElement('td');
+    titleCell.textContent = row.title;
+
+    const statusCell = document.createElement('td');
+    const badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.dataset.status = row.status;
+    badge.textContent = ALIGN_STATUS_TEXT[row.status] || row.status;
+    statusCell.appendChild(badge);
+
+    const xCell = document.createElement('td');
+    const xInput = document.createElement('input');
+    xInput.type = 'number';
+    xInput.step = '.01';
+    xInput.className = 'plan-shift';
+    xInput.value = row.shift_x_mm ?? 0;
+    xInput.setAttribute('aria-label', 'X shift for ' + row.title);
+    xInput.addEventListener('input', () => { row.shift_x_mm = parseFloat(xInput.value) || 0; });
+    xCell.appendChild(xInput);
+
+    const yCell = document.createElement('td');
+    const yInput = document.createElement('input');
+    yInput.type = 'number';
+    yInput.step = '.01';
+    yInput.className = 'plan-shift';
+    yInput.value = row.shift_y_mm ?? 0;
+    yInput.setAttribute('aria-label', 'Y shift for ' + row.title);
+    yInput.addEventListener('input', () => { row.shift_y_mm = parseFloat(yInput.value) || 0; });
+    yCell.appendChild(yInput);
+
+    const confCell = document.createElement('td');
+    confCell.textContent = row.confidence == null ? '—' : Number(row.confidence).toFixed(2);
+
+    const edgeCell = document.createElement('td');
+    edgeCell.className = 'edge-cell';
+    edgeCell.textContent = edgeSummary(row);
+    edgeCell.title = row.reason ? (ALIGN_REASON_TEXT[row.reason] || row.reason) : '';
+
+    tr.append(useCell, indexCell, titleCell, statusCell, xCell, yCell, confCell, edgeCell);
+    return tr;
+  }));
+}
+
+function choicesFromPlan(useFull) {
+  return desk.planRows
+    .filter(row => row.apply !== false)
+    .map(row => ({
+      frame: row.frame,
+      shift_x_mm: useFull ? (row.alignment_shift_x_mm ?? row.shift_x_mm ?? 0) : (row.shift_x_mm ?? 0),
+      shift_y_mm: useFull ? (row.alignment_shift_y_mm ?? row.shift_y_mm ?? 0) : (row.shift_y_mm ?? 0),
+      status: useFull && row.status === 'edge-limited' ? 'aligned' : (row.status || 'manual'),
+      confidence: row.confidence ?? null,
+      score: row.score ?? null,
+      reason: useFull ? null : (row.reason ?? null),
+      dx: row.dx ?? 0,
+      dy: row.dy ?? 0,
+    }));
+}
+
+on('demoAlign', 'click', openAlignmentDemo);
+on('welcomeAlign', 'click', openAlignmentDemo);
+async function openAlignmentDemo() {
+  clearProof();
+  const draft = await ask('/demo-alignment', 'POST', {});
+  renderDraft(draft, false);
+  await refreshLibrary();
+  notice('Opened the moon jitter sample. The scenery marks are ready — choose Suggest translation set.');
+}
+
+on('markRefs', 'click', async () => {
+  if (desk.marking) {
+    desk.marking = false;
+    syncMarkButton();
+    frameStage();
+  } else {
+    enterMarking();
+  }
+});
+
+on('suggestAlign', 'click', async () => {
+  const frame = desk.draft?.frames[currentFrame()];
+  if (!frame) throw new Error('Select a frame first.');
+  if (!desk.markRegions.length) {
+    throw new Error('Drag at least one box around fixed scenery, such as the moon or ground line.');
+  }
+  const maxShift = parseFloat(ui('alignMax').value);
+  if (!Number.isFinite(maxShift) || maxShift < .25) throw new Error('Enter the maximum allowed offset in mm.');
+  notice('Matching the marked scenery across every frame…');
+  const draft = await ask(draftPath() + '/alignment/suggest', 'POST', {
+    revision: desk.draft.revision,
+    reference_frame: frame.id,
+    space: 'cell',
+    max_shift_mm: maxShift,
+    regions: desk.markRegions.map(region => ({ box: region.box, label: region.label || null })),
+  });
+  renderDraft(draft);
+  const summary = draft.alignment_plan.summary;
+  notice('Suggested shifts: ' + summary.reliable + ' reliable, ' + summary.unresolved +
+    ' without a trustworthy reference. Review the table, then apply.');
+  ui('alignPlanPanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+});
+
+on('applyAlign', 'click', async () => {
+  const frames = choicesFromPlan(false);
+  if (!frames.length) throw new Error('Tick at least one frame to apply.');
+  const draft = await ask(draftPath() + '/alignment/apply', 'POST', {
+    revision: desk.draft.revision, frames,
+  });
+  renderDraft(draft);
+  notice('Applied the calibrated base to ' + frames.length +
+    ' frames. Offsets, mirror and scale are untouched — Play the direct loop, toggle Calibrated framing to compare, or save the Print clipping map.');
+});
+
+on('applyFullAlign', 'click', async () => {
+  const frames = choicesFromPlan(true);
+  if (!frames.length) throw new Error('Tick at least one reliable frame to apply.');
+  const draft = await ask(draftPath() + '/alignment/apply', 'POST', {
+    revision: desk.draft.revision, frames,
+  });
+  renderDraft(draft);
+  notice('Applied full landmark shifts to ' + frames.length + ' frames (edge cap ignored). Check the clipping map.');
+});
+
+on('discardAlign', 'click', async () => {
+  desk.planRows = [];
+  ui('alignPlanPanel').hidden = true;
+});
+
+on('resetAlign', 'click', async () => {
+  const draft = await ask(draftPath() + '/alignment/reset', 'POST', {
+    revision: desk.draft.revision,
+  });
+  renderDraft(draft);
+  notice('Cleared every calibrated base shift. Picture offsets, mirror and scale were kept.');
+});
+
+ui('calToggle').addEventListener('change', event => {
+  desk.calibrationOn = event.target.checked;
+  stopPlayback();
+  renderFrames();
+  frameStage();
+});
+
+on('saveCal', 'click', async () => {
+  const frame = desk.draft.frames[currentFrame()];
+  if (!frame) return;
+  const shiftX = parseFloat(ui('calShiftX').value) || 0;
+  const shiftY = parseFloat(ui('calShiftY').value) || 0;
+  const draft = await ask(draftPath() + '/frames/' + desk.active + '/calibration', 'PUT', {
+    revision: desk.draft.revision,
+    calibration: { shift_x: shiftX, shift_y: shiftY, status: 'manual' },
+  });
+  renderDraft(draft);
+  notice('Fine-tuned the calibration base.');
+});
+
+on('clearCal', 'click', async () => {
+  const draft = await ask(draftPath() + '/frames/' + desk.active + '/calibration', 'PUT', {
+    revision: desk.draft.revision,
+    calibration: { shift_x: 0, shift_y: 0, status: 'off' },
+  });
+  renderDraft(draft);
+  notice('Cleared this frame’s calibration base.');
 });
 
 (async () => {

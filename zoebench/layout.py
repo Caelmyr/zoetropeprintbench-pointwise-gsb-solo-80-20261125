@@ -73,9 +73,21 @@ def ordinal_slots(track, slot_width, phase):
     return [((cell.center - track.circumference / 2 + phase) % track.circumference, slot_width) for cell in track.cells]
 
 
-def paint_cell(source, frame, track, cell, width, height, stock=None):
+def screen_size(track, cell, max_edge=520):
+    scale = max_edge / max(cell.width, track.height)
+    return max(1, round(cell.width * scale)), max(1, round(track.height * scale))
+
+
+def paint_cell(source, frame, track, cell, width, height, stock=None, calibration=True):
+    if calibration is True:
+        cal = frame.get("calibration")
+    elif calibration is False:
+        cal = None
+    else:
+        cal = calibration
     return raster.place(
         source, frame["transform"], (width, height), (cell.width, track.height), stock,
+        calibration=cal,
     )
 
 

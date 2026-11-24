@@ -73,6 +73,21 @@
             <button class="paper-button">Extract frames</button>
           </form>
         </details>
+        <details id="alignControls" open>
+          <summary>Fixed-scenery alignment</summary>
+          <div class="stack align-controls">
+            <p class="hint">Set reference marks on one frame around stationary scenery (thin moon, ground line), then suggest translation shifts for every frame. Keep the moving bird out of the marks.</p>
+            <button type="button" id="demoAlign" class="paper-button">Try the moon alignment sample</button>
+            <button type="button" id="markRefs" class="paper-button">Mark reference scenery on selected frame</button>
+            <div id="markList" class="mark-list" hidden></div>
+            <label>Max offset / maximum shift (mm)
+              <input type="number" id="alignMax" name="max_shift_mm" step=".1" min=".25" max="25" value="6">
+            </label>
+            <button type="button" id="suggestAlign" class="accent">Suggest alignment shifts</button>
+            <button type="button" id="resetAlign" class="quiet">Clear all calibration</button>
+            <p id="alignHint" class="hint" role="status">Recommends one translation per frame within the maximum offset; frames without a reliable reference are flagged, never guessed from the bird.</p>
+          </div>
+        </details>
         <details id="scanControls">
           <summary>Slit photograph</summary>
           <form id="importScan" class="stack">
@@ -96,7 +111,10 @@
         <div>
           <h1>From frames to a spinning drum</h1>
           <p>Lay out a picture ribbon, check what the viewing slits will show, and print the band at actual size.</p>
-          <button id="welcomeDemo" class="accent">Try the reed bird sample</button>
+          <div class="welcome-actions">
+            <button id="welcomeDemo" class="accent">Try the reed bird sample</button>
+            <button id="welcomeAlign" class="paper-button">Try moon alignment sample</button>
+          </div>
         </div>
         <img src="/static/reed-bird.png" alt="A paper-cut green bird and a golden sun from the synthetic example">
       </section>
@@ -125,12 +143,49 @@
                   <img id="markedScan" alt="Slot scan to mark" draggable="false">
                   <div id="scanBox"></div>
                 </div>
+                <div id="alignStage" hidden>
+                  <img id="alignImage" alt="Frame to mark fixed scenery" draggable="false">
+                  <div id="markLayer"></div>
+                </div>
                 <img id="stageImage" alt="Current drum artwork or saved proof" hidden>
                 <p id="stageEmpty">Import an image or open a sample to see the artwork.</p>
               </div>
               <div class="stage-caption">
                 <span id="stageName"></span>
+                <label class="check cal-toggle" title="Use the calibrated negative base in the direct loop and frame view">
+                  <input type="checkbox" id="calToggle" checked> Calibrated framing
+                </label>
                 <button id="play" type="button" class="quiet">Play direct loop</button>
+              </div>
+            </section>
+
+            <section id="alignPlanPanel" class="frame-panel align-plan-panel" hidden>
+              <div class="panel-title">
+                <h2>Translation suggestions</h2>
+                <span id="alignPlanSummary"></span>
+              </div>
+              <p class="hint">Shifts move each negative to line the marked scenery up with the reference. Unresolved frames have no trustworthy mark match and stay at zero; they are never guessed from the bird.</p>
+              <div class="row-block align-plan-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Use</th>
+                      <th scope="col">#</th>
+                      <th scope="col">Frame</th>
+                      <th scope="col">Status</th>
+                      <th scope="col">X (mm)</th>
+                      <th scope="col">Y (mm)</th>
+                      <th scope="col">Conf.</th>
+                      <th scope="col">Edge / clipping</th>
+                    </tr>
+                  </thead>
+                  <tbody id="alignPlanRows"></tbody>
+                </table>
+              </div>
+              <div class="frame-actions">
+                <button type="button" id="applyAlign" class="accent">Apply selected shifts</button>
+                <button type="button" id="applyFullAlign" class="paper-button">Apply full alignment</button>
+                <button type="button" id="discardAlign" class="quiet">Close</button>
               </div>
             </section>
 
@@ -156,6 +211,21 @@
                   <button type="button" id="remove" class="quiet danger">Remove frame</button>
                 </div>
               </form>
+              <div id="calBase" class="cal-base" hidden>
+                <div class="cal-base-head">
+                  <strong>Calibrated negative base</strong>
+                  <span id="calStatus" class="badge"></span>
+                </div>
+                <p class="hint">Alignment layer under your offset, mirror and scale. Fine-tune it here; picture controls stay separate.</p>
+                <div class="fields">
+                  <label>Base X (mm) <input type="number" step=".01" id="calShiftX"></label>
+                  <label>Base Y (mm) <input type="number" step=".01" id="calShiftY"></label>
+                </div>
+                <div class="frame-actions">
+                  <button type="button" id="saveCal" class="paper-button">Nudge calibration</button>
+                  <button type="button" id="clearCal" class="quiet danger">Clear calibration</button>
+                </div>
+              </div>
             </section>
           </div>
           <aside class="side-work">

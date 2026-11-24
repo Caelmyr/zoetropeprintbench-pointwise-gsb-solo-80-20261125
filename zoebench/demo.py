@@ -63,6 +63,7 @@ def frame_record(library, image, original, title, source_name):
     return {
         "id": identity(), "title": title, "filename": source_name, "blob": library.keep(original),
         "width": image.width, "height": image.height, "transform": model.frame_transform({}),
+        "calibration": model.frame_calibration({}),
     }
 
 
@@ -81,3 +82,97 @@ def create(library):
         "registration": {"crop": [.025, .27, .975, .72], "scan_span_mm": 288, "origin_mm": 0},
     }
     return library.create("Reed bird · sample drum", model.settings({}), frames, slot_scan, synthetic=True)
+
+
+ALIGN_JITTER = [(0, 0), (7, -5), (-9, 4), (4, 9), (-6, -7), (11, 3), (2, -2), (-3, 6), (6, -9)]
+ALIGN_BAD_INDEX = 6
+ALIGN_SIZE = (432, 600)
+
+
+def alignment_artwork(index, count=9):
+    """Moon + ground stay put in art space; a jitter stands in for camera framing."""
+    from random import Random
+
+    width, height = ALIGN_SIZE
+    jx, jy = ALIGN_JITTER[index]
+    rnd = Random(3000 + index)
+    image = Image.new("RGBA", (width, height), (244, 238, 220, 255))
+    pen = ImageDraw.Draw(image)
+    for _ in range(6000):
+        x, y = rnd.randrange(width), rnd.randrange(height)
+        delta = rnd.randint(-8, 6)
+        pen.point((x, y), fill=(244 + delta, 238 + delta, 220 + delta, 255))
+
+    def p(x, y):
+        return x + jx, y + jy
+
+    mx, my = p(372, 96)
+    pen.ellipse((mx - 24, my - 24, mx + 24, my + 24), fill=(232, 190, 92, 255))
+    pen.ellipse((mx - 12, my - 29, mx + 30, my + 19), fill=(244, 238, 220, 255))
+    pen.ellipse((mx - 24, my - 24, mx + 24, my + 24), outline=(190, 140, 60, 255), width=2)
+    sx, sy = p(300, 60)
+    pen.ellipse((sx - 3, sy - 3, sx + 3, sy + 3), fill=(120, 130, 110, 255))
+
+    points = []
+    for x in range(-10, width + 11, 12):
+        y = 512 + int(6 * sin(x / 70.0))
+        points.append(p(x, y))
+    pen.line(points, fill=(96, 110, 88, 255), width=4, joint="curve")
+
+    for base_x, lean in ((14, 10), (30, -8), (width - 16, -12), (width - 34, 9)):
+        gx, gy = p(base_x, 514)
+        pen.line((gx, gy, gx + lean, gy - 78), fill=(84, 112, 78, 255), width=5)
+        pen.line((gx + 4, gy, gx + 4 + lean // 2, gy - 52), fill=(104, 132, 92, 255), width=4)
+
+    rx, ry = p(96, 470)
+    pen.line((rx, ry + 44, rx + 6, ry - 34), fill=(110, 122, 96, 255), width=5)
+    pen.ellipse((rx - 12, ry - 46, rx + 16, ry - 20), fill=(150, 120, 70, 255))
+
+    t = index / count * 2 * pi
+    bx = 150 + 190 * (index / max(1, count - 1)) + jx
+    by = 300 - 120 * sin(t) + jy
+    flap = 34 * sin(t * 2)
+    pen.polygon([(bx - 30, by), (bx - 92, by + 26), (bx - 66, by - 16), (bx - 34, by - 20)],
+                fill=(37, 78, 71, 255))
+    pen.ellipse((bx - 46, by - 22, bx + 44, by + 34), fill=(35, 119, 99, 255))
+    hx = bx + 36
+    pen.ellipse((hx - 16, by - 30, hx + 16, by + 4), fill=(47, 138, 115, 255))
+    pen.polygon([(hx + 12, by - 16), (hx + 40, by - 11), (hx + 13, by - 4)], fill=(229, 161, 67, 255))
+    pen.polygon([(bx + 6, by + 8), (bx - 8, by - 56 + flap), (bx - 46, by - 34 + flap),
+                 (bx - 30, by + 10)], fill=(85, 165, 145, 255))
+    pen.ellipse((hx + 2, by - 21, hx + 8, by - 15), fill=(20, 30, 26, 255))
+
+    if index == ALIGN_BAD_INDEX:
+        from PIL import ImageFilter
+
+        image = image.filter(ImageFilter.GaussianBlur(7))
+        wash = Image.new("RGBA", image.size, (238, 234, 222, 255))
+        image = Image.blend(image, wash, .55).filter(ImageFilter.GaussianBlur(2))
+    return image
+
+
+def create_alignment(library):
+    frames = []
+    for index in range(len(ALIGN_JITTER)):
+        source = alignment_artwork(index)
+        filename = f"moon-line-{index + 1:02}.png"
+        title = f"Moon {index + 1:02}" + (" (soft focus)" if index == ALIGN_BAD_INDEX else "")
+        frames.append(frame_record(library, source, raster.png(source), title, filename))
+    settings = model.settings({"circumference": 324, "height_mm": 50, "align_max_shift_mm": 2.5})
+    draft = library.create("Thin moon · camera jitter sample", settings, frames, None, synthetic=True)
+    draft_alignment = {
+        "reference_frame": frames[0]["id"],
+        "space": "cell",
+        "max_shift_mm": 2.5,
+        "regions": [
+            {"box": [.68, .10, .88, .24], "label": "Thin moon"},
+            {"box": [.02, .82, .98, .90], "label": "Ground line"},
+        ],
+    }
+    # Persist the starter marks directly (library.create already wrote revision 1).
+    key = draft["id"]
+
+    def seed(saved):
+        saved["alignment"] = draft_alignment
+
+    return library.change(key, draft["revision"], seed)
