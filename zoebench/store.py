@@ -66,12 +66,13 @@ class Library:
             key=lambda row: row["updated"], reverse=True,
         )
 
-    def create(self, title, settings, frames=None, scan=None, synthetic=False):
+    def create(self, title, settings, frames=None, scan=None, synthetic=False, band=None):
         with self.guard:
             key, now = identity(), stamp()
             draft = {
                 "id": key, "title": title, "created": now, "updated": now, "revision": 1,
                 "frames": frames or [], "scan": scan, "proofs": [], "settings": settings,
+                "band": band if band is not None else {"frame_count": 8, "captures": []},
                 "synthetic": synthetic,
             }
             atomic_write(self.drafts / (key + ".json"), json_bytes(draft))

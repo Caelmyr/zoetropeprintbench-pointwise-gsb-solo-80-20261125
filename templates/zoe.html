@@ -56,6 +56,20 @@
             <button class="paper-button">Save drum setup</button>
           </form>
         </details>
+        <details id="bandControls">
+          <summary>Old band reassembly</summary>
+          <form id="bandCount" class="stack">
+            <label>Frames on the old band <input name="frame_count" type="number" min="2" max="24" required></label>
+            <button class="paper-button">Save frame count</button>
+          </form>
+          <form id="bandUpload" class="stack secondary-form">
+            <label>Flat band photo <input type="file" name="file" accept="image/png,image/jpeg,image/tiff,image/webp" required></label>
+            <button class="paper-button">Add band photo</button>
+          </form>
+          <p class="band-hint">Mark each photo's visible strip and two frame boundaries you recognise. Name them in the order they read on the strip — the numbers calibrate the old band's pitch. A frame is only taken from a photo that shows all of it.</p>
+          <div id="bandCaptures" class="band-captures"></div>
+          <button id="bandReview" type="button" class="paper-button">Review frame sources</button>
+        </details>
         <details>
           <summary>Import artwork</summary>
           <form id="importFrame" class="stack">
@@ -92,7 +106,42 @@
     </aside>
 
     <section class="workbench">
-      <section id="welcome" class="welcome">
+      <section id="bandPanel" class="band-panel" hidden aria-labelledby="bandPanelTitle">
+        <div class="band-head">
+          <div>
+            <h2 id="bandPanelTitle">Old band · frame sources</h2>
+            <p id="bandSummary" class="mode-note"></p>
+          </div>
+          <button id="closeBand" type="button" class="quiet">Close</button>
+        </div>
+        <p id="bandHelp" class="band-hint">The recommendation balances reproduced line clarity with the brightness step between neighbouring frames around the loop. Frames no photo captured completely stay as numbered gaps.</p>
+        <div id="markStage" class="mark-stage" hidden>
+          <div class="mark-title">
+            <strong id="markName"></strong>
+            <button id="cancelMark" type="button" class="quiet">Cancel</button>
+          </div>
+          <div class="mark-canvas" id="markCanvas">
+            <img id="markImage" alt="Band photo to mark" draggable="false">
+            <div id="markRect" class="mark-rect"></div>
+            <div id="markTicks" class="mark-ticks"></div>
+          </div>
+          <p class="band-hint">Drag a rectangle around the visible strip. Then place two boundaries you recognise on the old band.</p>
+          <div class="fields mark-fields">
+            <label>Boundary A frame <input id="markFrameA" type="number" min="1" max="24"></label>
+            <label>Boundary A position <input id="markPosA" type="range" min="0" max="1" step="0.001" value="0.3"></label>
+            <label>Boundary B frame <input id="markFrameB" type="number" min="1" max="24"></label>
+            <label>Boundary B position <input id="markPosB" type="range" min="0" max="1" step="0.001" value="0.7"></label>
+          </div>
+          <p id="markPreview" class="band-hint"></p>
+          <button id="saveMark" type="button" class="paper-button">Save marking</button>
+        </div>
+        <div id="bandSlots" class="band-slots"></div>
+        <div class="band-actions">
+          <button id="adoptBand" type="button" class="accent">Use this sequence</button>
+          <span id="bandStatus" class="status" role="status"></span>
+        </div>
+      </section>
+      <div id="welcome" class="welcome">
         <div>
           <h1>From frames to a spinning drum</h1>
           <p>Lay out a picture ribbon, check what the viewing slits will show, and print the band at actual size.</p>
@@ -137,6 +186,15 @@
             <section class="frame-panel" aria-labelledby="framesTitle">
               <div class="panel-title"><h2 id="framesTitle">Picture frames</h2><span id="frameCount"></span></div>
               <div id="frames" class="frames"></div>
+              <section id="frameSource" class="frame-source" hidden>
+                <h3>From the old band</h3>
+                <p id="sourceText" class="mode-note"></p>
+                <div class="source-actions">
+                  <a id="sourcePhoto" class="text-link">Open original photo ↗</a>
+                  <button id="showSource" type="button" class="quiet">Show take on photo</button>
+                </div>
+                <img id="sourceOverlay" alt="The original band photo with this frame's take outlined" hidden>
+              </section>
               <form id="frameAdjust" hidden>
                 <div class="frame-selection">
                   <h3 id="frameTitle"></h3>

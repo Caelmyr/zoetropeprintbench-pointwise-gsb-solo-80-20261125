@@ -7,7 +7,7 @@ from flask import Blueprint, Response, jsonify, render_template, request, send_f
 
 from image_lab.validation import Conflict, Invalid
 
-from . import demo, layout, model, proof, raster
+from . import band as band_plan, demo, layout, model, proof, raster
 from .store import Library
 
 MAX_DRUM_FRAME_BYTES = 100 * 1024 * 1024
@@ -52,7 +52,7 @@ def append_frames(draft, items, library):
     all_frames = draft["frames"] + items
     if len(all_frames) > model.MAX_IMAGES:
         raise Invalid(f"A drum holds at most {model.MAX_IMAGES} frames.")
-    blobs = {frame["blob"] for frame in all_frames}
+    blobs = {frame["blob"] for frame in all_frames if frame.get("blob")}
     blobs.update(frame["contact"]["sheet"] for frame in all_frames if "contact" in frame)
     size = sum(library.blob(digest).stat().st_size for digest in blobs)
     if size > MAX_DRUM_FRAME_BYTES:
@@ -189,8 +189,22 @@ def install(app, root):
     def frame_asset(key, frame_key, view):
         draft = library.draft(key)
         frame = model.find(draft["frames"], frame_key, "source frame")
-        raw = library.blob(frame["blob"])
         model.option(view, ("thumb", "original", "prepared"), "frame view")
+        index = next(index for index, item in enumerate(draft["frames"]) if item["id"] == frame_key)
+        if frame.get("missing"):
+            if view == "original":
+                raise Invalid("This old-band frame was not captured by any marked photo.")
+            track = layout.uniform_track(len(draft["frames"]), draft["settings"])
+            cell = track.cells[index]
+            number = (frame.get("band") or {}).get("slot", index + 1)
+            if view == "thumb":
+                scale = 190 / max(cell.width, track.height)
+                size = (max(1, round(cell.width * scale)), max(1, round(track.height * scale)))
+            else:
+                size = proof.screen_size(track, cell)
+            pixels = layout.empty_panel(size, number, draft["settings"]["stock"]).convert("RGB")
+            return Response(raster.png(pixels), mimetype="image/png")
+        raw = library.blob(frame["blob"])
         if view == "original":
             return send_file(raw, download_name=frame["filename"], as_attachment=True)
         if view == "thumb":
@@ -198,9 +212,147 @@ def install(app, root):
             pixels.thumbnail((190, 210))
         else:
             track = layout.uniform_track(len(draft["frames"]), draft["settings"])
-            index = next(index for index, item in enumerate(draft["frames"]) if item["id"] == frame_key)
             pixels = proof.styled_frame(lambda _: raster.decode(raw.read_bytes()), draft, track, index)
         return Response(raster.png(pixels), mimetype="image/png")
+
+    @api.get("/drafts/<key>/frames/<frame_key>/band-photo")
+    def frame_band_photo(key, frame_key):
+        draft = library.draft(key)
+        frame = model.find(draft["frames"], frame_key, "source frame")
+        source = frame.get("band")
+        if not isinstance(source, dict) or not source.get("source_blob") or source.get("missing"):
+            raise Invalid("This frame was not taken from a marked band photo.")
+        digest = source["source_blob"]
+        if not source.get("photo", "").lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp")):
+            raise Invalid("The marked band photo identity is invalid.")
+        return send_file(library.blob(digest), download_name=source["photo"], as_attachment=True)
+
+    @api.get("/drafts/<key>/frames/<frame_key>/band-overlay")
+    def frame_band_overlay(key, frame_key):
+        draft = library.draft(key)
+        frame = model.find(draft["frames"], frame_key, "source frame")
+        source = frame.get("band")
+        if not isinstance(source, dict) or source.get("missing"):
+            raise Invalid("This frame was not taken from a marked band photo.")
+        image = band_plan.overlay(library, source)
+        return Response(raster.png(image), mimetype="image/png")
+
+    @api.get("/drafts/<key>/band")
+    def band_detail(key):
+        draft = library.draft(key)
+        return jsonify(band=band_plan.state(draft), plan=band_plan.evaluate(draft, library))
+
+    @api.put("/drafts/<key>/band")
+    def update_band(key):
+        data = payload()
+
+        def change(draft):
+            record = band_plan.state(draft)
+            if "frame_count" in data:
+                record["frame_count"] = band_plan.validate_frame_count(data["frame_count"])
+            if "clear_plan" in data and data["clear_plan"]:
+                record["adopted"] = None
+
+        return jsonify(library.change(key, data.get("revision"), change))
+
+    @api.post("/drafts/<key>/band/captures")
+    def add_band_capture(key):
+        revision = form_revision()
+        check_revision(library.draft(key), revision)
+        image, original, filename = upload()
+        title = model.string(request.form.get("title") or Path(filename).stem, "a band photo title")
+        capture = {
+            "id": band_plan.identity(), "title": title, "filename": filename,
+            "blob": library.keep(original), "width": image.width, "height": image.height,
+            "registration": None,
+        }
+        digest = capture["blob"]
+
+        def change(draft):
+            record = band_plan.state(draft)
+            if len(record["captures"]) >= band_plan.MAX_CAPTURES:
+                raise Invalid(f"Mark at most {band_plan.MAX_CAPTURES} old-band photos per drum.")
+            if any(item["blob"] == digest for item in record["captures"]):
+                raise Invalid("This band photo is already marked in the drum.")
+            size = sum(library.blob(item["blob"]).stat().st_size for item in record["captures"])
+            size += library.blob(digest).stat().st_size
+            if size > MAX_DRUM_FRAME_BYTES:
+                raise Invalid("Use no more than 100 MiB of band photos per drum.")
+            record["captures"].append(capture)
+
+        return jsonify(library.change(key, revision, change)), 201
+
+    @api.put("/drafts/<key>/band/captures/<capture_key>")
+    def register_band_capture(key, capture_key):
+        data = payload()
+
+        def change(draft):
+            record = band_plan.state(draft)
+            capture = model.find(record["captures"], capture_key, "band photo")
+            capture["registration"] = band_plan.registration(data.get("registration", {}))
+
+        return jsonify(library.change(key, data.get("revision"), change))
+
+    @api.delete("/drafts/<key>/band/captures/<capture_key>")
+    def remove_band_capture(key, capture_key):
+        data = payload()
+
+        def change(draft):
+            record = band_plan.state(draft)
+            record["captures"].remove(model.find(record["captures"], capture_key, "band photo"))
+
+        return jsonify(library.change(key, data.get("revision"), change))
+
+    @api.get("/drafts/<key>/band/captures/<capture_key>/image")
+    def band_capture_image(key, capture_key):
+        draft = library.draft(key)
+        record = band_plan.state(draft)
+        capture = model.find(record["captures"], capture_key, "band photo")
+        image = raster.decode(library.blob(capture["blob"]).read_bytes())
+        image.thumbnail((1600, 800))
+        return Response(raster.png(image), mimetype="image/png")
+
+    @api.post("/drafts/<key>/band/plan")
+    def band_recommendation(key):
+        draft = library.draft(key)
+        return jsonify(band=band_plan.state(draft), plan=band_plan.evaluate(draft, library))
+
+    @api.post("/drafts/<key>/band/adopt")
+    def adopt_band_plan(key):
+        data = payload()
+
+        def change(draft):
+            plan = band_plan.evaluate(draft, library)
+            override = data.get("slots")
+            if override:
+                plan = band_plan.apply_overrides(plan, override)
+            frames = band_plan.frames_from_plan(draft, plan, library)
+            band_plan.adopt(draft, plan, frames)
+            existing = [index for index, frame in enumerate(draft["frames"])
+                        if isinstance(frame.get("band"), dict)]
+            if existing:
+                kept = [frame for frame in draft["frames"] if not isinstance(frame.get("band"), dict)]
+                at = min(existing[0], len(kept))
+                draft["frames"] = kept[:at] + frames + kept[at:]
+            else:
+                draft["frames"] = draft["frames"] + frames
+            if len(draft["frames"]) > model.MAX_IMAGES:
+                raise Invalid(f"A drum holds at most {model.MAX_IMAGES} frames.")
+
+        return jsonify(library.change(key, data.get("revision"), change))
+
+    @api.get("/drafts/<key>/band/take/<int:frame>/<capture_key>")
+    def band_take(key, frame, capture_key):
+        draft = library.draft(key)
+        plan = band_plan.evaluate(draft, library)
+        slot = next((row for row in plan["slots"] if row["frame"] == frame), None)
+        if slot is None:
+            raise Invalid("That old-band frame is outside this sequence.")
+        match = next((row for row in slot["alternatives"] if row["capture"] == capture_key), None)
+        if match is None:
+            raise Invalid("That band photo does not capture this whole frame.")
+        image = band_plan.take_thumbnail(draft, match, library)
+        return Response(raster.png(image), mimetype="image/png")
 
     @api.post("/drafts/<key>/scan")
     def add_scan(key):

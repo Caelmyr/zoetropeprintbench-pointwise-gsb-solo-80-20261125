@@ -67,10 +67,30 @@ def uniform_track(frame_count, settings):
     return Track(cells, circumference, settings["height_mm"], settings["dpi"], settings["join_mm"])
 
 
+
 def ordinal_slots(track, slot_width, phase):
     if slot_width >= track.pitch / 2:
         raise Invalid("Viewing slots must be narrower than half the distance between centers.")
     return [((cell.center - track.circumference / 2 + phase) % track.circumference, slot_width) for cell in track.cells]
+
+
+def empty_panel(size, number, stock):
+    """A hatched, visibly unfilled picture slot that keeps its old number."""
+    slot = Image.new("RGBA", size, (*raster.PAPER[stock], 255))
+    draw = ImageDraw.Draw(slot)
+    width, height = size
+    step = max(5, round(min(width, height) / 9))
+    for offset in range(-height, width + height, step):
+        draw.line((offset, 0, offset - height, height), fill=SOFT_INK, width=1)
+    draw.rectangle((0, 0, width - 1, height - 1), outline=SOFT_INK, width=1)
+    if min(width, height) >= 12:
+        draw.text((width / 2, height / 2), f"{number:02}", fill=CUT_INK, anchor="mm")
+    return slot
+
+
+def empty_cell(track, cell, stock):
+    """An unfilled slot at print resolution."""
+    return empty_panel((track.x(cell.width), track.x(track.height)), cell.number + 1, stock).convert("RGB")
 
 
 def paint_cell(source, frame, track, cell, width, height, stock=None):
@@ -84,6 +104,9 @@ def picture_ribbon(track, frames, source, stock):
     height = band.height
     for frame, cell in zip(frames, track.cells, strict=True):
         left, right = track.x(cell.start), track.x(cell.end)
+        if frame.get("missing"):
+            band.paste(empty_cell(track, cell, stock), (left, 0))
+            continue
         picture, _, _ = paint_cell(source(frame), frame, track, cell, right - left, height, raster.PAPER[stock])
         band.paste(picture.convert("RGB"), (left, 0))
     return band
@@ -106,7 +129,7 @@ def scale_ruler(track):
     return image
 
 
-def cut_guide(track):
+def cut_guide(track, frames=None):
     width, drawn_height = track.exact_image_size
     y_top = track.x(5)
     y_low = y_top + drawn_height
@@ -118,7 +141,11 @@ def cut_guide(track):
         center = track.x(cell.center)
         draw.line((left, y_top, left, y_low), fill=SOFT_INK, width=1)
         draw.line((center, 2, center, y_top - 1), fill=TEAL, width=2)
-        draw.text((center, y_low + track.x(2)), str(cell.number + 1), fill=CUT_INK, anchor="mt")
+        frame = frames[cell.number] if frames else None
+        number = (frame.get("band") or {}).get("slot", cell.number + 1) if frame else cell.number + 1
+        draw.text((center, y_low + track.x(2)), str(number), fill=CUT_INK, anchor="mt")
+        if frame and frame.get("missing"):
+            draw.line((left, y_low, track.x(cell.end), y_top), fill=ORANGE, width=2)
     if track.join_mm:
         start = track.x(track.circumference)
         draw.rectangle((start, y_top, width - 1, y_low), outline=ORANGE, width=2)

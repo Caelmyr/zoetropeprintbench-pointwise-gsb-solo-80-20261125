@@ -2,6 +2,7 @@ const ui = id => document.getElementById(id);
 const desk = {
   config: null, draft: null, active: null, record: null, crop: null,
   drawing: null, playback: null, busy: false,
+  band: null, plan: null, reviewing: false, marking: null, markDrag: null, overrides: {},
 };
 
 async function ask(path, method = 'GET', value = null) {
@@ -110,7 +111,10 @@ function frameStage() {
     return;
   }
   const mode = desk.draft.frames.length > 1 ? 'prepared' : 'thumb';
-  showImage(framePath(frame.id, mode), frame.title, frame.title + ' · current artwork');
+  const note = frame.missing
+    ? frame.title + ' · gap in the loop'
+    : frame.title + ' · current artwork';
+  showImage(framePath(frame.id, mode), frame.title, note);
 }
 
 function renderFrames() {
@@ -119,15 +123,16 @@ function renderFrames() {
   ui('frames').replaceChildren(...frames.map((item, index) => {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'frame-tile';
+    button.className = 'frame-tile' + (item.missing ? ' missing' : '');
     button.title = item.title;
-    button.setAttribute('aria-label', 'Select frame ' + (index + 1) + ', ' + item.title);
     button.setAttribute('aria-pressed', String(item.id === desk.active));
     const icon = new Image();
     icon.src = framePath(item.id, 'thumb');
     icon.alt = '';
     const number = document.createElement('span');
-    number.textContent = String(index + 1).padStart(2, '0');
+    const slot = item.band && item.band.slot ? item.band.slot : index + 1;
+    number.textContent = String(slot).padStart(2, '0') + (item.missing ? ' · gap' : '');
+    button.setAttribute('aria-label', 'Select frame ' + slot + ', ' + item.title + (item.missing ? ', not captured' : ''));
     button.append(icon, number);
     button.addEventListener('click', () => {
       if (desk.busy) return;
@@ -145,13 +150,51 @@ function renderFrames() {
 }
 
 function renderAdjustment(frame) {
-  ui('frameAdjust').hidden = !frame;
-  if (!frame) return;
+  const missing = Boolean(frame?.missing);
+  ui('frameAdjust').hidden = !frame || missing;
+  ui('frameSource').hidden = !frame || !frame.band;
+  if (!frame) {
+    ui('sourceOverlay').hidden = true;
+    return;
+  }
+  if (frame.band) {
+    const source = frame.band;
+    if (missing) {
+      ui('sourceText').textContent = source.note || 'No marked photo captured this frame completely, so it stays an empty beat in its original place.';
+      ui('sourcePhoto').hidden = true;
+      ui('showSource').hidden = true;
+      ui('sourceOverlay').hidden = true;
+    } else {
+      ui('sourceText').textContent =
+        'Old-band frame ' + String(source.slot).padStart(2, '0') + ' of ' + source.frame_count +
+        ' · taken whole from ' + source.photo +
+        ' · line clarity ' + Number(source.clarity).toFixed(4) +
+        ' · mean luminance ' + Number(source.luminance).toFixed(3) +
+        ' · ' + Math.round((source.box?.[2] - source.box?.[0]) * 100) + '% of photo width';
+      ui('sourcePhoto').hidden = false;
+      ui('sourcePhoto').href = '/zoe' + draftPath() + '/frames/' + frame.id + '/band-photo';
+      ui('showSource').hidden = false;
+    }
+  }
+  if (missing) return;
   ui('frameTitle').textContent = frame.title;
   ui('downloadFrame').href = framePath(frame.id, 'original');
   fields(ui('frameAdjust'), frame.transform);
   ui('earlier').disabled = currentFrame() < 1;
   ui('later').disabled = currentFrame() >= desk.draft.frames.length - 1;
+}
+
+function showSourceOverlay() {
+  const frame = desk.draft.frames[currentFrame()];
+  const image = ui('sourceOverlay');
+  if (!frame || !frame.band || frame.band.missing) return;
+  if (image.dataset.frame === frame.id && !image.hidden) {
+    image.hidden = true;
+    return;
+  }
+  image.src = '/zoe' + draftPath() + '/frames/' + frame.id + '/band-overlay?revision=' + desk.draft.revision;
+  image.dataset.frame = frame.id;
+  image.hidden = false;
 }
 
 function renderArchive() {
@@ -176,6 +219,7 @@ function renderDraft(draft, preserveFrame = true) {
   if (draft.scan) fields(ui('register'), draft.scan.registration);
   renderFrames();
   renderArchive();
+  renderBand();
   frameStage();
   history.replaceState({}, '', '/?drum=' + draft.id);
 }
@@ -295,6 +339,321 @@ ui('scanStage').addEventListener('pointercancel', () => {
   if (desk.draft.scan) setCrop([...desk.draft.scan.registration.crop]);
 });
 
+// ------------------------------------------------------ old band reassembly
+
+function renderBand() {
+  const band = desk.draft.band || { frame_count: 8, captures: [] };
+  ui('bandCount').elements.frame_count.value = band.frame_count;
+  const captures = band.captures || [];
+  ui('bandCaptures').replaceChildren(...captures.map((capture, index) => {
+    const row = document.createElement('div');
+    row.className = 'band-capture' + (capture.registration ? ' ready' : '');
+    const line = document.createElement('div');
+    line.className = 'row';
+    const name = document.createElement('strong');
+    name.textContent = (index + 1) + '. ' + capture.title;
+    const state = document.createElement('small');
+    state.textContent = capture.registration ? 'marked' : 'not marked';
+    line.append(name, state);
+    const detail = document.createElement('div');
+    detail.className = 'capline';
+    const low = capture.registration?.boundaries?.[0];
+    const high = capture.registration?.boundaries?.[1];
+    detail.innerHTML = capture.registration
+      ? 'Boundaries: frame <b>' + low.frame + '</b> at ' + low.position.toFixed(3) +
+        ' · frame <b>' + high.frame + '</b> at ' + high.position.toFixed(3) +
+        ' · ' + capture.width + '×' + capture.height + ' px'
+      : 'Mark the visible strip and two named boundaries before reviewing sources.';
+    const actions = document.createElement('div');
+    actions.className = 'capture-actions';
+    const mark = document.createElement('button');
+    mark.type = 'button';
+    mark.textContent = capture.registration ? 'Re-mark' : 'Mark strip';
+    mark.addEventListener('click', () => startMarking(capture));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'quiet danger';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => removeCapture(capture));
+    actions.append(mark, remove);
+    row.append(line, detail, actions);
+    return row;
+  }));
+  if (!captures.length) {
+    const empty = document.createElement('p');
+    empty.className = 'band-hint';
+    empty.textContent = 'No band photo yet. Add the flat photographs of the old strip.';
+    ui('bandCaptures').append(empty);
+  }
+}
+
+async function reloadBand(message) {
+  const result = await ask(draftPath() + '/band');
+  desk.draft.band = result.band;
+  desk.plan = result.plan;
+  desk.overrides = {};
+  renderBand();
+  renderBandPlan();
+  if (message) notice(message);
+}
+
+function reviewBand() {
+  desk.reviewing = true;
+  ui('bandPanel').hidden = false;
+  ui('bandPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  ui('bandStatus').textContent = '';
+  reloadBand();
+}
+
+function closeBand() {
+  desk.reviewing = false;
+  ui('bandPanel').hidden = true;
+}
+
+function captureLabel(plan, id) {
+  const capture = plan.captures.find(row => row.id === id);
+  return capture ? 'Photo ' + capture.index + ' · ' + capture.photo : 'Photo';
+}
+
+function chosenCapture(slot) {
+  const override = desk.overrides[slot.frame];
+  if (override !== undefined) return override;
+  return slot.status === 'taken' ? slot.source.capture : null;
+}
+
+function renderBandPlan() {
+  const plan = desk.plan;
+  if (!plan) {
+    ui('bandSlots').replaceChildren();
+    ui('adoptBand').disabled = true;
+    return;
+  }
+  const summary = plan.summary;
+  ui('bandSummary').textContent =
+    summary.taken + ' of ' + summary.frames + ' frames taken whole from marked photos · ' +
+    summary.missing + ' gap' + (summary.missing === 1 ? '' : 's') +
+    (summary.max_neighbour_jump === null ? '' : ' · largest neighbour luminance step ' + Number(summary.max_neighbour_jump).toFixed(3)) +
+    (summary.ready_captures ? '' : ' · mark at least one photo first');
+  const ready = plan.captures.some(row => row.ready);
+  const slots = plan.slots.map(slot => {
+    const card = document.createElement('div');
+    card.className = 'band-slot ' + (chosenCapture(slot) ? 'taken' : 'missing');
+    const head = document.createElement('div');
+    head.className = 'slot-head';
+    const name = document.createElement('span');
+    name.textContent = 'Frame ' + String(slot.frame).padStart(2, '0');
+    const count = document.createElement('em');
+    count.textContent = slot.alternatives.length + (slot.alternatives.length === 1 ? ' take' : ' takes');
+    head.append(name, count);
+    card.append(head);
+    const chosen = chosenCapture(slot);
+    const match = chosen ? slot.alternatives.find(row => row.capture === chosen) : null;
+    const preview = new Image();
+    preview.alt = '';
+    if (chosen) {
+      const adopted = selectedFrameId(slot);
+      preview.src = adopted
+        ? framePath(adopted, 'thumb')
+        : '/zoe' + draftPath() + '/band/take/' + slot.frame + '/' + chosen + '?revision=' + desk.draft.revision;
+      preview.title = 'From ' + captureLabel(plan, chosen);
+      const read = document.createElement('div');
+      read.className = 'slot-read';
+      if (match) {
+        read.textContent = 'clarity ' + Number(match.relative_clarity).toFixed(2) +
+          ' · luma ' + Number(match.luminance).toFixed(3);
+      }
+      card.append(preview, read);
+    } else {
+      preview.className = 'missing-art';
+      preview.alt = 'Not captured';
+      const read = document.createElement('div');
+      read.className = 'slot-note';
+      read.textContent = slot.alternatives.length
+        ? 'Partly visible only; no whole take inside a marked strip.'
+        : (slot.note || 'Not visible in any marked photo.');
+      card.append(preview, read);
+    }
+    if (slot.alternatives.length > 1) {
+      const select = document.createElement('select');
+      select.setAttribute('aria-label', 'Source for old-band frame ' + slot.frame);
+      for (const option of slot.alternatives) {
+        select.append(new Option(
+          captureLabel(plan, option.capture) + ' · clarity ' + Number(option.relative_clarity).toFixed(2) +
+          ' · luma ' + Number(option.luminance).toFixed(3) +
+          (slot.status === 'taken' && option.capture === slot.source.capture ? ' · recommended' : ''),
+          option.capture,
+        ));
+      }
+      select.value = chosen || '';
+      select.addEventListener('change', () => {
+        const recommended = slot.status === 'taken' ? slot.source.capture : null;
+        if (select.value === recommended) delete desk.overrides[slot.frame];
+        else desk.overrides[slot.frame] = select.value || null;
+        renderBandPlan();
+      });
+      card.append(select);
+    }
+    return card;
+  });
+  ui('bandSlots').replaceChildren(...slots);
+  ui('adoptBand').disabled = !ready || !plan.slots.some(slot => chosenCapture(slot));
+  ui('adoptBand').textContent = Object.keys(desk.overrides).length ? 'Use this source set' : 'Use recommended sequence';
+}
+
+function selectedFrameId(slot) {
+  const chosen = chosenCapture(slot);
+  if (!chosen) return null;
+  const frame = (desk.draft.frames || []).find(item => item.band && item.band.slot === slot.frame &&
+    item.band.capture === chosen);
+  return frame ? frame.id : null;
+}
+
+async function removeCapture(capture) {
+  if (!window.confirm('Remove band photo ' + capture.title + '?')) return;
+  renderDraft(await ask(draftPath() + '/band/captures/' + capture.id, 'DELETE', { revision: desk.draft.revision }));
+  notice('Removed the band photo.');
+  if (desk.reviewing) await reloadBand();
+}
+
+function startMarking(capture) {
+  desk.marking = capture;
+  desk.markDrag = null;
+  ui('markStage').hidden = false;
+  ui('markName').textContent = 'Marking ' + capture.title;
+  ui('markImage').src = '/zoe' + draftPath() + '/band/captures/' + capture.id + '/image?revision=' + desk.draft.revision;
+  const registration = capture.registration || {
+    quad: [[.05, .27], [.95, .27], [.95, .73], [.05, .73]],
+    boundaries: [{ frame: 1, position: .3 }, { frame: 2, position: .7 }],
+  };
+  desk.marking.quad = registration.quad.map(point => [...point]);
+  desk.marking.boundaries = registration.boundaries.map(row => ({ ...row }));
+  ui('markFrameA').value = desk.marking.boundaries[0].frame;
+  ui('markFrameB').value = desk.marking.boundaries[1].frame;
+  ui('markPosA').value = desk.marking.boundaries[0].position;
+  ui('markPosB').value = desk.marking.boundaries[1].position;
+  drawMark();
+}
+
+function drawMark() {
+  const capture = desk.marking;
+  if (!capture) return;
+  const [x0, y0] = capture.quad[0];
+  const stripWidth = Math.max(0, capture.quad[1][0] - x0);
+  const stripHeight = Math.max(0, capture.quad[2][1] - y0);
+  Object.assign(ui('markRect').style, {
+    left: x0 * 100 + '%', top: y0 * 100 + '%',
+    width: stripWidth * 100 + '%', height: stripHeight * 100 + '%',
+  });
+  const ticks = capture.boundaries.map(boundary => {
+    const tick = document.createElement('i');
+    tick.style.left = (x0 + boundary.position * stripWidth) * 100 + '%';
+    tick.style.top = y0 * 100 + '%';
+    tick.style.bottom = (1 - (y0 + stripHeight)) * 100 + '%';
+    const label = document.createElement('b');
+    label.textContent = String(boundary.frame);
+    tick.append(label);
+    return tick;
+  });
+  ui('markTicks').replaceChildren(...ticks);
+  updateMarkPreview();
+}
+
+function updateMarkPreview() {
+  const capture = desk.marking;
+  if (!capture) return;
+  const [first, second] = capture.boundaries;
+  const distance = Math.abs((second.frame - first.frame) / (second.position - first.position));
+  const width = Math.max(.001, capture.quad[1][0] - capture.quad[0][0]);
+  ui('markPreview').textContent =
+    'One old frame is about ' + (width / distance * 100).toFixed(1) + '% of the marked strip ' +
+    '(' + (width * 100).toFixed(0) + '% of the photo width). Frames touching the strip edge stay gaps.';
+}
+
+function markPoint(event) {
+  const box = ui('markImage').getBoundingClientRect();
+  return [Math.max(0, Math.min(1, (event.clientX - box.left) / box.width)),
+    Math.max(0, Math.min(1, (event.clientY - box.top) / box.height))];
+}
+
+ui('markCanvas').addEventListener('pointerdown', event => {
+  if (!desk.marking) return;
+  desk.markDrag = markPoint(event);
+  ui('markCanvas').setPointerCapture(event.pointerId);
+});
+ui('markCanvas').addEventListener('pointermove', event => {
+  if (!desk.markDrag || !desk.marking) return;
+  const [startX, startY] = desk.markDrag;
+  const [endX, endY] = markPoint(event);
+  const x0 = Math.min(startX, endX), x1 = Math.max(startX, endX);
+  const y0 = Math.min(startY, endY), y1 = Math.max(startY, endY);
+  desk.marking.quad = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  drawMark();
+});
+ui('markCanvas').addEventListener('pointerup', () => { desk.markDrag = null; });
+ui('markCanvas').addEventListener('pointercancel', () => { desk.markDrag = null; });
+for (const [frameId, positionId, index] of [
+  ['markFrameA', 'markPosA', 0], ['markFrameB', 'markPosB', 1],
+]) {
+  const frameInput = ui(frameId), positionInput = ui(positionId);
+  const update = () => {
+    if (!desk.marking) return;
+    desk.marking.boundaries[index] = {
+      frame: Math.max(1, Math.round(Number(frameInput.value) || 1)),
+      position: Number(positionInput.value),
+    };
+    drawMark();
+  };
+  frameInput.addEventListener('input', update);
+  positionInput.addEventListener('input', update);
+}
+
+on('bandCount', 'submit', async event => {
+  renderDraft(await ask(draftPath() + '/band', 'PUT', {
+    revision: desk.draft.revision, frame_count: event.target.elements.frame_count.value,
+  }));
+  await reloadBand();
+  notice('Saved the old band frame count.');
+});
+on('bandUpload', 'submit', async event => {
+  const data = new FormData(event.target);
+  data.set('revision', String(desk.draft.revision));
+  renderDraft(await ask(draftPath() + '/band/captures', 'POST', data));
+  event.target.reset();
+  await reloadBand();
+  notice('Added the band photo. Mark its strip to use it.');
+});
+on('bandReview', 'click', reviewBand);
+on('closeBand', 'click', closeBand);
+on('showSource', 'click', showSourceOverlay);
+on('cancelMark', 'click', () => {
+  desk.marking = null;
+  ui('markStage').hidden = true;
+});
+on('saveMark', 'click', async () => {
+  const capture = desk.marking;
+  if (!capture) return;
+  renderDraft(await ask(draftPath() + '/band/captures/' + capture.id, 'PUT', {
+    revision: desk.draft.revision,
+    registration: { quad: capture.quad, boundaries: capture.boundaries },
+  }));
+  desk.marking = null;
+  ui('markStage').hidden = true;
+  if (!desk.reviewing) reviewBand();
+  else await reloadBand();
+  notice('Saved the strip marking.');
+});
+on('adoptBand', 'click', async () => {
+  const slots = {};
+  for (const [frame, capture] of Object.entries(desk.overrides)) slots[frame] = capture;
+  const result = await ask(draftPath() + '/band/adopt', 'POST', {
+    revision: desk.draft.revision, slots,
+  });
+  desk.plan = null;
+  renderDraft(result);
+  await reloadBand();
+  notice('Placed the old-band frames in their original order. Gaps keep their numbers.');
+});
+
 on('welcomeDemo', 'click', openDemo);
 on('demo', 'click', openDemo);
 on('library', 'change', async () => {
@@ -374,13 +733,11 @@ on('play', 'click', () => {
   const speed = desk.draft.settings.rpm;
   const direction = desk.draft.settings.direction === 'clockwise' ? 1 : -1;
   let index = Math.max(0, currentFrame());
-  const sources = frames.map(frame => {
-    const image = new Image();
-    image.src = framePath(frame.id, 'prepared');
-    return image.src;
-  });
+  const sources = frames.map(frame => framePath(frame.id, 'prepared'));
   const step = () => {
-    showImage(sources[index], frames[index].title, 'Direct loop · frame ' + (index + 1));
+    const frame = frames[index];
+    showImage(sources[index], frame.title,
+      'Direct loop · frame ' + (index + 1) + (frame.missing ? ' · not captured' : ''));
     index = (index + frames.length + direction) % frames.length;
   };
   step();
